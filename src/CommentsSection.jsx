@@ -1,56 +1,58 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, List, Avatar, Typography, Space, Button, Spin } from 'antd';
 import { MessageOutlined, ReloadOutlined } from '@ant-design/icons';
+import axios from 'axios';
+import moment from 'moment'; // For timestamp formatting, install if needed: npm i moment
 
 const { Text, Title } = Typography;
 
-const CommentSection = () => {
-  // Заглушка данных комментариев
-  const mockComments = [
-    {
-      id: 1,
-      author: 'Иван Петров',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=ivan',
-      content: 'Отличная новость! Жду роста акций в ближайшее время 🚀',
-      timestamp: '2 минуты назад',
-      likes: 5
-    },
-    {
-      id: 2,
-      author: 'Мария Сидорова',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=maria',
-      content: 'Какие прогнозы по дивидендам на следующий квартал?',
-      timestamp: '15 минут назад',
-      likes: 3
-    },
-    {
-      id: 3,
-      author: 'Алексей Козлов',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=alexey',
-      content: 'Только что купил ещё пачку акций. Верю в компанию! 💪',
-      timestamp: '1 час назад',
-      likes: 12
-    },
-    {
-      id: 4,
-      author: 'Телеграм Канал',
-      avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=telegram',
-      content: '📊 Обновление: Торговый объем превысил средние значения на 45%',
-      timestamp: '2 часа назад',
-      likes: 8,
-      isChannel: true
-    }
-  ];
+const CommentSection = ({ marketId = '1' }) => {
+  const [comments, setComments] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
-  const [comments, setComments] = React.useState(mockComments);
-  const [loading, setLoading] = React.useState(false);
+  const fetchComments = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      // Supabase Edge Function endpoint with Authorization header
+      const response = await axios.get(`https://xgfxijjcebvgokwutcfx.supabase.co/functions/v1/fetch-comments`, {
+        headers: {
+          'Authorization': 'Bearer sbp_0e61ee801b49fb57e1a804b160165a7d1080477f',
+          'Content-Type': 'application/json'
+        }
+      });
+      const data = response.data;
+      
+      // Verify structure (assume data is array or data.comments)
+      let commentsData = Array.isArray(data) ? data : (data.comments || []);
+      if (Array.isArray(commentsData)) {
+        // Format timestamps if needed (backend may return ISO, convert to relative)
+        const formattedComments = commentsData.map(comment => ({
+          ...comment,
+          timestamp: moment(comment.timestamp || new Date()).fromNow() // e.g., "4 days ago"
+        }));
+        setComments(formattedComments);
+      } else {
+        throw new Error('Invalid comments data');
+      }
+    } catch (err) {
+      console.error('Failed to fetch comments:', err);
+      setError('Failed to load comments from backend.');
+      setComments([]); // No fallback comments; rely only on endpoint
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchComments(); // Initial load
+    const interval = setInterval(fetchComments, 300000); // Auto-refresh every 5 minutes
+    return () => clearInterval(interval);
+  }, [marketId]);
 
   const refreshComments = () => {
-    setLoading(true);
-    setTimeout(() => {
-      setLoading(false);
-      // В реальном приложении здесь будет запрос к API
-    }, 1000);
+    fetchComments();
   };
 
   return (
@@ -98,6 +100,10 @@ const CommentSection = () => {
             <div style={{ marginTop: '16px' }}>
               <Text type="secondary">Загрузка новых комментариев...</Text>
             </div>
+          </div>
+        ) : error ? (
+          <div style={{ padding: '20px', textAlign: 'center', color: '#ff4d4f' }}>
+            <Text type="danger">{error}</Text>
           </div>
         ) : (
           <List

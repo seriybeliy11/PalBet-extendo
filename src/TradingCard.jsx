@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Space, Typography, Input, Slider, Divider, Modal, Tag } from 'antd';
+import { Button, Card, Space, Typography, Input, Slider, Divider, Modal, Tag, Alert } from 'antd';
 import { ShoppingCartOutlined, DollarOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import styled from 'styled-components';
 import axios from 'axios';
@@ -86,8 +86,9 @@ const TradeInterfaceBlue = () => {
   const [betAmount, setBetAmount] = useState(1);
   const [modalVisible, setModalVisible] = useState(false);
   const [offerPrice, setOfferPrice] = useState(0.5);
+  const [tonTxHash, setTonTxHash] = useState('');
   const [sellAmount, setSellAmount] = useState(0);
-  const [sellPrice, setSellPrice] = useState(0);
+  const [minPrice, setMinPrice] = useState(0);
   const [potentialProfit, setPotentialProfit] = useState(0);
   const [market, setMarket] = useState(null);
   const [user, setUser] = useState(null);
@@ -95,9 +96,17 @@ const TradeInterfaceBlue = () => {
   const [selectedPosition, setSelectedPosition] = useState(null);
   const [sellProfit, setSellProfit] = useState({ usdt: 0, percent: 0 });
   const [error, setError] = useState(null);
+  const [success, setSuccess] = useState(null);
+  const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
 
   const userId = '1'; // Replace with actual user ID from auth system
   const marketId = '1'; // Hardcoded for the single market in the backend
+
+  // Calculate total portfolio value
+  useEffect(() => {
+    const totalValue = purchasedContracts.reduce((sum, pos) => sum + (pos.currentValue || 0), 0);
+    setTotalPortfolioValue(totalValue);
+  }, [purchasedContracts]);
 
   // Fetch user data
   useEffect(() => {
@@ -111,22 +120,26 @@ const TradeInterfaceBlue = () => {
       }
     };
     fetchUser();
-  }, []);
+  }, [userId]);
 
   // Fetch market data
   useEffect(() => {
     const fetchMarket = async () => {
       try {
         const response = await axios.get(`http://localhost:5000/api/market/${marketId}`);
-        setMarket(response.data);
-        setOfferPrice(response.data.yesPrice); // Set initial offer price to current yesPrice
+        const marketData = response.data;
+        setMarket(marketData);
+        if (marketData) {
+          const currentPrice = marketData.yesPrice; // Default to yes
+          setOfferPrice(currentPrice);
+        }
       } catch (err) {
         setError('Failed to fetch market data');
         console.error(err);
       }
     };
     fetchMarket();
-  }, []);
+  }, [marketId]);
 
   // Fetch user positions
   useEffect(() => {
@@ -140,23 +153,26 @@ const TradeInterfaceBlue = () => {
       }
     };
     fetchPositions();
-  }, []);
+    const interval = setInterval(fetchPositions, 5000); // Refresh every 5s for updates
+    return () => clearInterval(interval);
+  }, [userId]);
 
-  // Calculate potential profit for buying
+  // Calculate potential profit for buying (using current price)
   useEffect(() => {
-    if (prediction && betAmount > 0) {
-      const profit = (1 - offerPrice) * betAmount;
+    if (prediction && betAmount > 0 && market) {
+      const currentPrice = prediction === 'yes' ? market.yesPrice : market.noPrice;
+      const profit = (1 - currentPrice) * betAmount;
       setPotentialProfit(profit);
     } else {
       setPotentialProfit(0);
     }
-  }, [prediction, betAmount, offerPrice]);
+  }, [prediction, betAmount, market]);
 
-  // Calculate sell profit
+  // Calculate sell profit (using minPrice as sell price for estimation)
   useEffect(() => {
-    if (selectedPosition && sellPrice > 0) {
+    if (selectedPosition && minPrice > 0) {
       const purchaseValue = selectedPosition.purchasePrice * selectedPosition.quantity;
-      const sellValue = sellPrice * (sellAmount || selectedPosition.quantity);
+      const sellValue = minPrice * (sellAmount || selectedPosition.quantity);
       const profitUsdt = sellValue - purchaseValue;
       const profitPercent = purchaseValue ? ((sellValue - purchaseValue) / purchaseValue) * 100 : 0;
       
@@ -167,57 +183,64 @@ const TradeInterfaceBlue = () => {
     } else {
       setSellProfit({ usdt: 0, percent: 0 });
     }
-  }, [selectedPosition, sellPrice, sellAmount]);
+  }, [selectedPosition, minPrice, sellAmount]);
 
   const handleBuy = async () => {
+    if (!user.tonWalletAddress) {
+      setError('Please set your TON wallet address first');
+      return;
+    }
+    if (!tonTxHash) {
+      setError('TON transaction hash is required');
+      return;
+    }
     try {
+      const currentPrice = prediction === 'yes' ? market.yesPrice : market.noPrice;
       const response = await axios.post('http://localhost:5000/api/buy', {
         userId,
         marketId,
         type: prediction,
         quantity: betAmount,
-        offerPrice
+        offerPrice: Math.max(offerPrice, currentPrice), // Ensure >= current
+        tonTxHash
       });
-      // Refresh positions and user data
-      const [positionsResponse, userResponse] = await Promise.all([
-        axios.get(`http://localhost:5000/api/positions/${userId}`),
-        axios.get(`http://localhost:5000/api/user/${userId}`)
+      setSuccess('Buy order placed successfully! TX: ' + tonTxHash);
+      setError(null);
+      // Refresh data
+      const [positionsResponse] = await Promise.all([
+        axios.get(`http://localhost:5000/api/positions/${userId}`)
       ]);
       setPurchasedContracts(positionsResponse.data);
-      setUser(userResponse.data);
       setModalVisible(false);
       setPrediction(null);
       setBetAmount(1);
-      setError(null);
+      setTonTxHash('');
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to buy contracts');
       console.error(err);
     }
   };
 
-  const handleSell = async () => {
+  const handleSellRequest = async () => {
     if (!selectedPosition) return;
-    
     try {
-      const response = await axios.post('http://localhost:5000/api/sell', {
+      const currentPrice = selectedPosition.type === 'yes' ? market.yesPrice : market.noPrice;
+      const response = await axios.post('http://localhost:5000/api/sell/request', {
         userId,
         positionId: selectedPosition.id,
         quantity: sellAmount || selectedPosition.quantity,
-        sellPrice
+        minPrice: Math.min(minPrice, currentPrice) // Ensure <= current
       });
-      // Refresh positions and user data
-      const [positionsResponse, userResponse] = await Promise.all([
-        axios.get(`http://localhost:5000/api/positions/${userId}`),
-        axios.get(`http://localhost:5000/api/user/${userId}`)
-      ]);
+      setSuccess('Sell request submitted successfully. Request ID: ' + response.data.requestId + '. Waiting for admin confirmation.');
+      setError(null);
+      // Refresh positions (though update after confirm)
+      const positionsResponse = await axios.get(`http://localhost:5000/api/positions/${userId}`);
       setPurchasedContracts(positionsResponse.data);
-      setUser(userResponse.data);
       setSelectedPosition(null);
       setSellAmount(0);
-      setSellPrice(0);
-      setError(null);
+      setMinPrice(0);
     } catch (err) {
-      setError(err.response?.data?.message || 'Failed to sell contracts');
+      setError(err.response?.data?.message || 'Failed to submit sell request');
       console.error(err);
     }
   };
@@ -225,8 +248,22 @@ const TradeInterfaceBlue = () => {
   const handlePositionSelect = (position) => {
     setSelectedPosition(position);
     setSellAmount(position.quantity);
-    setSellPrice(position.currentPrice);
+    const currentPrice = position.type === 'yes' ? market?.yesPrice : market?.noPrice;
+    setMinPrice(currentPrice || 0.5);
   };
+
+  const getCurrentPrice = () => {
+    if (!market || !prediction) return 0.5;
+    return prediction === 'yes' ? market.yesPrice : market.noPrice;
+  };
+
+  if (market && market.status !== 'open') {
+    return (
+      <Card>
+        <Alert message="Market is closed" type="warning" />
+      </Card>
+    );
+  }
 
   return (
     <Card
@@ -239,11 +276,16 @@ const TradeInterfaceBlue = () => {
       }}
       bodyStyle={{ padding: 24 }}
     >
-      {/* Display user balance */}
-      {user && (
-        <div style={{ marginBottom: 16, padding: 12, background: '#f0f8ff', borderRadius: 8 }}>
-          <Text strong>Баланс: </Text>
-          <Text>{user.balance.toFixed(2)} USDT</Text>
+      {/* Display portfolio value */}
+      <div style={{ marginBottom: 16, padding: 12, background: '#f0f8ff', borderRadius: 8 }}>
+        <Text strong>Портфель: </Text>
+        <Text>{totalPortfolioValue.toFixed(2)} USDT</Text>
+      </div>
+
+      {/* Display success message */}
+      {success && (
+        <div style={{ marginBottom: 16, padding: 12, background: '#f6ffed', borderRadius: 8 }}>
+          <Text type="success">{success}</Text>
         </div>
       )}
 
@@ -346,7 +388,7 @@ const TradeInterfaceBlue = () => {
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <Text type="secondary">Текущая цена:</Text>
-                  <Text strong>{market ? (prediction === 'yes' ? market.yesPrice : market.noPrice).toFixed(2) : '0.00'} USDT</Text>
+                  <Text strong>{getCurrentPrice().toFixed(2)} USDT</Text>
                 </div>
               </InfoBlock>
 
@@ -355,7 +397,7 @@ const TradeInterfaceBlue = () => {
                 style={{ background: '#1890ff', borderColor: '#1890ff' }} 
                 block
                 onClick={() => setModalVisible(true)}
-                disabled={!prediction || !market}
+                disabled={!prediction || !market || !user?.tonWalletAddress}
               >
                 Предложить цену
               </Button>
@@ -398,12 +440,15 @@ const TradeInterfaceBlue = () => {
                           </Text>
                           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
                             <Text strong>Текущая: {contract.currentPrice.toFixed(2)} USDT</Text>
-                            {contract.currentPrice > contract.purchasePrice ? (
+                            {contract.unrealizedPnL >= 0 ? (
                               <ArrowUpOutlined style={{ color: '#52c41a', marginLeft: 4 }} />
                             ) : (
                               <ArrowDownOutlined style={{ color: '#f5222d', marginLeft: 4 }} />
                             )}
                           </div>
+                          <Text type="secondary" style={{ fontSize: '11px' }}>
+                            PnL: {contract.unrealizedPnL.toFixed(2)} USDT
+                          </Text>
                         </div>
                       </div>
                     </PositionCard>
@@ -432,13 +477,13 @@ const TradeInterfaceBlue = () => {
 
                   <div>
                     <Text type="secondary" style={{ fontSize: '12px', display: 'block', marginBottom: 4 }}>
-                      Цена продажи за контракт (USDT)
+                      Минимальная цена продажи за контракт (USDT)
                     </Text>
                     <Input 
                       suffix="USDT" 
                       placeholder="0.00" 
-                      value={sellPrice}
-                      onChange={(e) => setSellPrice(parseFloat(e.target.value) || 0)}
+                      value={minPrice}
+                      onChange={(e) => setMinPrice(parseFloat(e.target.value) || 0)}
                     />
                   </div>
 
@@ -461,10 +506,10 @@ const TradeInterfaceBlue = () => {
                     type="primary" 
                     style={{ background: '#1890ff', borderColor: '#1890ff' }} 
                     block
-                    onClick={handleSell}
-                    disabled={sellAmount <= 0 || sellPrice <= 0}
+                    onClick={handleSellRequest}
+                    disabled={sellAmount <= 0 || minPrice <= 0}
                   >
-                    Продать контракты
+                    Подать запрос на продажу
                   </Button>
                 </>
               )}
@@ -487,6 +532,7 @@ const TradeInterfaceBlue = () => {
             type="primary" 
             style={{ background: '#1890ff', borderColor: '#1890ff' }}
             onClick={handleBuy}
+            disabled={!tonTxHash}
           >
             Купить {betAmount} контрактов
           </Button>,
@@ -510,11 +556,11 @@ const TradeInterfaceBlue = () => {
           
           <div>
             <Text type="secondary" style={{ fontSize: '12px', display: 'block', marginBottom: 4 }}>
-              Предлагаемая цена за контракт (USDT)
+              Максимальная цена за контракт (USDT, ≥ текущей)
             </Text>
             <Slider 
-              min={0.01} 
-              max={market ? (prediction === 'yes' ? market.yesPrice : market.noPrice) : 0.99}
+              min={getCurrentPrice()} 
+              max={0.99}
               step={0.01}
               value={offerPrice}
               onChange={setOfferPrice}
@@ -522,17 +568,30 @@ const TradeInterfaceBlue = () => {
               handleStyle={{ borderColor: '#1890ff' }}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8 }}>
-              <Text type="secondary">0.01 USDT</Text>
+              <Text type="secondary">{getCurrentPrice().toFixed(2)} USDT</Text>
               <Text strong>{offerPrice.toFixed(2)} USDT</Text>
-              <Text type="secondary">{market ? (prediction === 'yes' ? market.yesPrice : market.noPrice).toFixed(2) : '0.99'} USDT</Text>
+              <Text type="secondary">0.99 USDT</Text>
             </div>
           </div>
 
           <Divider />
           
+          <div>
+            <Text type="secondary" style={{ fontSize: '12px', display: 'block', marginBottom: 4 }}>
+              TON TX Hash (обязательно)
+            </Text>
+            <Input 
+              placeholder="Введите хэш транзакции TON"
+              value={tonTxHash}
+              onChange={(e) => setTonTxHash(e.target.value)}
+            />
+          </div>
+
+          <Divider />
+          
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <Text>Общая стоимость:</Text>
-            <Text strong type="success">{(offerPrice * betAmount).toFixed(2)} USDT</Text>
+            <Text>Общая стоимость (при текущей цене):</Text>
+            <Text strong type="success">{(getCurrentPrice() * betAmount).toFixed(2)} USDT</Text>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
             <Text>Потенциальная прибыль:</Text>

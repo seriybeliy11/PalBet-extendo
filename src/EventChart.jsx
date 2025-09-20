@@ -1,62 +1,58 @@
 import React, { useState, useEffect } from 'react';
 import { Line } from '@ant-design/charts';
 import { Card, Typography, Spin } from 'antd';
+import axios from 'axios';
 
 const { Title } = Typography;
 
-const DarkBlueGradientChart = () => {
+const DarkBlueGradientChart = ({ userId = '1', title = 'Прогресс показателей', height = 300, onDataLoaded, onError }) => {
   const [chartData, setChartData] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setErrorState] = useState(null);
 
   useEffect(() => {
     const fetchChartData = async () => {
+      setLoading(true);
+      setErrorState(null);
       try {
-        const response = await fetch('/api/user/1/monthly-performance');
+        const response = await axios.get(`http://localhost:5000/api/user/${userId}/monthly-performance`);
+        const data = response.data;
         
-        // Проверяем, что ответ успешный и содержит JSON
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+        // Verify data structure
+        if (!Array.isArray(data) || data.some(item => !item.month || typeof item.value !== 'number')) {
+          throw new Error('Invalid data structure');
         }
-        
-        const contentType = response.headers.get('content-type');
-        if (!contentType || !contentType.includes('application/json')) {
-          throw new Error('Response is not JSON');
-        }
-        
-        const data = await response.json();
+
         setChartData(data);
+        if (onDataLoaded) {
+          onDataLoaded(data);
+        }
       } catch (error) {
         console.error('Error fetching chart data:', error);
-        // Fallback data with all months
-        setChartData([
-          { month: 'Янв', value: 0 },
-          { month: 'Фев', value: 0 },
-          { month: 'Мар', value: 0 },
-          { month: 'Апр', value: 0 },
-          { month: 'Май', value: 0 },
-          { month: 'Июн', value: 0 },
-          { month: 'Июл', value: 0 },
-          { month: 'Авг', value: 0 },
-          { month: 'Сен', value: 0 },
-          { month: 'Окт', value: 0 },
-          { month: 'Ноя', value: 0 },
-          { month: 'Дек', value: 0 }
-        ]);
+        if (onError) {
+          onError(error.message);
+        }
+        setErrorState(error.message);
+        // Fallback data with last 12 months (generic months)
+        const months = ['Окт', 'Ноя', 'Дек', 'Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен'];
+        setChartData(months.map(month => ({ month, value: 0 })));
       } finally {
         setLoading(false);
       }
     };
 
     fetchChartData();
-  }, []);
+  }, [userId]);
 
   const config = {
     data: chartData,
     xField: 'month',
     yField: 'value',
-    height: 300,
+    height,
     smooth: true,
     color: '#177ddc',
+    background: 'transparent', // Прозрачный фон графика
+    padding: [20, 40, 40, 60], // Отступы для лучшего отображения осей
     area: {
       style: {
         fill: 'l(270) 0:#177ddc 0.5:#0654a2 1:#003a8c',
@@ -88,7 +84,8 @@ const DarkBlueGradientChart = () => {
       tickCount: 12,
       line: {
         style: {
-          stroke: '#434343',
+          stroke: '#8c8c8c', // Видимая линия оси X
+          lineWidth: 1,
         },
       },
       grid: {
@@ -106,6 +103,12 @@ const DarkBlueGradientChart = () => {
       },
     },
     yAxis: {
+      line: {
+        style: {
+          stroke: '#8c8c8c', // Видимая линия оси Y
+          lineWidth: 1,
+        },
+      },
       grid: {
         line: {
           style: {
@@ -134,21 +137,31 @@ const DarkBlueGradientChart = () => {
         },
       },
     },
-    theme: 'dark',
+    theme: {
+      background: 'transparent', // Прозрачный фон темы
+      ...'dark', // Сохраняем тёмную тему для других элементов
+    },
   };
 
   return (
     <Card
       styles={{
-        body: { padding: '24px' }
+        body: { 
+          padding: '24px',
+          background: 'transparent', // Прозрачный фон Card
+        }
       }}
     >
       <Title level={4} style={{ color: '#ffffff', marginBottom: '24px' }}>
-        Прогресс показателей
+        {title}
       </Title>
       {loading ? (
-        <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <Spin size="large" />
+        </div>
+      ) : error ? (
+        <div style={{ height, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ff4d4f' }}>
+          Error: {error}
         </div>
       ) : (
         <Line {...config} />

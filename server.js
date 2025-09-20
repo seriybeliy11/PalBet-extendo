@@ -5,32 +5,41 @@ import dotenv from 'dotenv';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import axios from 'axios';
+import crypto from 'crypto'; // Для generateId
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Get __dirname in ES Modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Path to JSON file
 const DATA_FILE = path.join(__dirname, 'data.json');
+const PENDING_SELLS_FILE = path.join(__dirname, 'pending-sells.json');
 
-// Middleware
+const INITIAL_VOLATILITY = 0;
+const PLATFORM_FEE = 0.02;
+const LIQUIDITY_FACTOR = 0.0001;
+
 app.use(cors());
 app.use(bodyParser.json());
 
-// Initial data structure
+// ========================
+// Модель данных — СИНХРОНИЗИРОВАНА СО СПЕЦИФИКАЦИЕЙ
+// ========================
+
 const initialData = {
   users: [
     {
       id: '1',
       username: 'testuser',
       email: 'test@example.com',
-      password: 'testpassword',
-      balance: 1000,
+      tonWalletAddress: null,
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     },
   ],
   markets: [
@@ -38,117 +47,175 @@ const initialData = {
       id: '1',
       title: 'Будет ли мирное соглашение в 2025 году?',
       description: 'Предсказание на мирное соглашение.',
-      resolutionDate: '2025-12-31',
+      endDate: '2025-12-31',
       status: 'open',
-      yesPrice: 0.62,
-      noPrice: 0.38,
-      previousYesPrice: 0.62,
-      previousNoPrice: 0.38,
+      yesPrice: 0.50,
+      noPrice: 0.50,
+      previousYesPrice: 0.50,
+      previousNoPrice: 0.50,
+      totalVolume: 0,
+      volume24h: 0,
+      volatility: INITIAL_VOLATILITY,
+      totalLiquidity: 10000,
       priceHistory: [
-        { timestamp: '2023-01-01T00:00:00Z', yesPrice: 0.50, noPrice: 0.50 },
-        { timestamp: '2023-02-01T00:00:00Z', yesPrice: 0.55, noPrice: 0.45 },
-        { timestamp: '2023-03-01T00:00:00Z', yesPrice: 0.52, noPrice: 0.48 },
-        { timestamp: '2023-04-01T00:00:00Z', yesPrice: 0.58, noPrice: 0.42 },
-        { timestamp: '2023-05-01T00:00:00Z', yesPrice: 0.60, noPrice: 0.40 },
-        { timestamp: '2023-06-01T00:00:00Z', yesPrice: 0.62, noPrice: 0.38 },
+        { 
+          timestamp: new Date().toISOString(), 
+          yesPrice: 0.50, 
+          noPrice: 0.50,
+          volume: 0,
+          priceImpact: 0,
+          transactionType: 'buy'
+        }
       ],
     },
   ],
-  positions: [
-    {
-      id: '1',
-      userId: '1',
-      marketId: '1',
-      type: 'yes',
-      quantity: 10,
-      purchasePrice: 0.45,
-      currentPrice: 0.62,
-      purchaseDate: '2023-10-15',
-    },
-    {
-      id: '2',
-      userId: '1',
-      marketId: '1',
-      type: 'no',
-      quantity: 5,
-      purchasePrice: 0.55,
-      currentPrice: 0.38,
-      purchaseDate: '2023-10-10',
-    },
-    {
-      id: '3',
-      userId: '1',
-      marketId: '1',
-      type: 'yes',
-      quantity: 3,
-      purchasePrice: 0.52,
-      currentPrice: 0.62,
-      purchaseDate: '2023-10-05',
-    },
-  ],
+  positions: [],
   transactions: [],
+  system: {
+    adminWallet: process.env.ADMIN_WALLET || 'EQAdminWalletAddress',
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
+    telegramChatId: process.env.TELEGRAM_CHAT_ID
+  }
 };
 
-// Initialize data file if it doesn't exist
+// ========================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ДОБАВЛЕНЫ/ИСПРАВЛЕНЫ)
+// ========================
+
+const generateId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 9);
+
 async function initializeData() {
   try {
     await fs.access(DATA_FILE);
   } catch {
-    await fs.writeFile(DATA_FILE, JSON.stringify(initialData, null, 2));
+    await saveData(initialData);
   }
 }
 
-// Load data from JSON file
 async function loadData() {
   try {
-    const rawData = await fs.readFile(DATA_FILE, 'utf-8');
-    return JSON.parse(rawData);
+    const data = await fs.readFile(DATA_FILE, 'utf8');
+    return JSON.parse(data);
   } catch (err) {
-    console.error('Error loading data:', err);
+    console.warn('Loading data failed, using initial:', err.message);
     return initialData;
   }
 }
 
-// Save data to JSON file
 async function saveData(data) {
   try {
     await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2));
   } catch (err) {
-    console.error('Error saving data:', err);
+    console.error('Saving data failed:', err.message);
+    throw err;
   }
 }
 
-// Helper to generate unique IDs
-const generateId = () => Math.random().toString(36).substr(2, 9);
+async function loadPendingSells() {
+  try {
+    const data = await fs.readFile(PENDING_SELLS_FILE, 'utf8');
+    return JSON.parse(data);
+  } catch {
+    return [];
+  }
+}
 
-// Helper to compute coefficients and changes
+async function savePendingSells(data) {
+  try {
+    await fs.writeFile(PENDING_SELLS_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('Saving pending sells failed:', err.message);
+    throw err;
+  }
+}
+
+async function sendTelegramNotification(message) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId) {
+    console.warn('Telegram config missing, skipping notification');
+    return;
+  }
+  try {
+    await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      chat_id: chatId,
+      text: message,
+      parse_mode: 'HTML'
+    });
+    console.log('Telegram notification sent');
+  } catch (err) {
+    console.error('Telegram notification failed:', err.message);
+  }
+}
+
+function calculatePriceImpact(quantity, currentPrice, liquidityFactor) {
+  const impact = quantity * liquidityFactor;
+  const maxImpact = 0.1;
+  return Math.sign(impact) * Math.min(Math.abs(impact), maxImpact);
+}
+
+function calculateFee(amount) {
+  return amount * PLATFORM_FEE;
+}
+
+function calculateTotalCost(principalAmount) {
+  const fee = calculateFee(principalAmount);
+  return principalAmount + fee;
+}
+
+function updateMarketPrices(market, tradeType, quantity) {
+  const currentYesPrice = market.yesPrice;
+  const currentNoPrice = market.noPrice;
+  
+  const impact = calculatePriceImpact(
+    quantity,
+    tradeType === 'yes' ? currentYesPrice : currentNoPrice,
+    LIQUIDITY_FACTOR
+  );
+  
+  let newYesPrice, newNoPrice;
+  
+  if (tradeType === 'yes') {
+    newYesPrice = Math.min(0.99, Math.max(0.01, currentYesPrice + impact));
+    newNoPrice = 1 - newYesPrice;
+  } else {
+    newNoPrice = Math.min(0.99, Math.max(0.01, currentNoPrice + impact));
+    newYesPrice = 1 - newNoPrice;
+  }
+  
+  return {
+    newYesPrice: parseFloat(newYesPrice.toFixed(4)),
+    newNoPrice: parseFloat(newNoPrice.toFixed(4)),
+    priceImpact: parseFloat(impact.toFixed(4))
+  };
+}
+
 function getMarketWithCoefficients(market) {
   if (!market) return null;
 
   const yesCoefficient = (1 / market.yesPrice).toFixed(2);
   const noCoefficient = (1 / market.noPrice).toFixed(2);
-  const yesChange = (market.yesPrice - market.previousYesPrice).toFixed(2);
-  const noChange = (market.noPrice - market.previousNoPrice).toFixed(2);
+  const yesChange = (market.yesPrice - market.previousYesPrice).toFixed(4);
+  const noChange = (market.noPrice - market.previousNoPrice).toFixed(4);
   const yesTrend = yesChange > 0 ? 'up' : 'down';
   const noTrend = noChange > 0 ? 'up' : 'down';
 
   return {
     ...market,
-    yesCoefficient,
-    noCoefficient,
-    yesChange: Math.abs(yesChange),
-    noChange: Math.abs(noChange),
+    yesCoefficient: parseFloat(yesCoefficient),
+    noCoefficient: parseFloat(noCoefficient),
+    yesChange: Math.abs(parseFloat(yesChange)),
+    noChange: Math.abs(parseFloat(noChange)),
     yesTrend,
     noTrend,
   };
 }
 
-// Initialize data file
-initializeData();
+// ========================
+// ЭНДПОИНТЫ
+// ========================
 
-// Endpoints
-
-// Get User Info
+// --- User ---
 app.get('/api/user/:userId', async (req, res) => {
   try {
     const data = await loadData();
@@ -160,7 +227,26 @@ app.get('/api/user/:userId', async (req, res) => {
   }
 });
 
-// Get Positions for User
+app.post('/api/user/:userId/wallet', async (req, res) => {
+  try {
+    const { walletAddress } = req.body;
+    if (!walletAddress) return res.status(400).json({ message: 'Wallet address required' });
+    const data = await loadData();
+    const user = data.users.find(u => u.id === req.params.userId);
+    
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    
+    user.tonWalletAddress = walletAddress;
+    user.updatedAt = new Date().toISOString();
+    await saveData(data);
+    
+    res.json({ message: 'Wallet updated successfully', tonWalletAddress: walletAddress });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// --- Positions ---
 app.get('/api/positions/:userId', async (req, res) => {
   try {
     const data = await loadData();
@@ -168,9 +254,13 @@ app.get('/api/positions/:userId', async (req, res) => {
       .filter(pos => pos.userId === req.params.userId)
       .map(pos => {
         const market = data.markets.find(m => m.id === pos.marketId);
+        if (!market) return pos; // Fallback if market gone
+        const currentPrice = pos.type === 'yes' ? market.yesPrice : market.noPrice;
         return {
           ...pos,
-          currentPrice: pos.type === 'yes' ? market.yesPrice : market.noPrice,
+          currentPrice,
+          currentValue: currentPrice * pos.quantity,
+          unrealizedPnL: (currentPrice - pos.purchasePrice) * pos.quantity,
         };
       });
     res.json(userPositions);
@@ -179,7 +269,7 @@ app.get('/api/positions/:userId', async (req, res) => {
   }
 });
 
-// Get Market Info with Coefficients
+// --- Market ---
 app.get('/api/market/:marketId', async (req, res) => {
   try {
     const data = await loadData();
@@ -192,21 +282,13 @@ app.get('/api/market/:marketId', async (req, res) => {
   }
 });
 
-// Get Market Price History
-app.get('/api/market/:marketId/price-history', async (req, res) => {
-  try {
-    const data = await loadData();
-    const market = data.markets.find(m => m.id === req.params.marketId);
-    if (!market) return res.status(404).json({ message: 'Market not found' });
-    res.json(market.priceHistory || []);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
-
-// Buy Contract
+// --- Buy ---
 app.post('/api/buy', async (req, res) => {
-  const { userId, marketId, type, quantity, offerPrice } = req.body;
+  const { userId, marketId, type, quantity, offerPrice, tonTxHash } = req.body;
+
+  // Валидация
+  if (!['yes', 'no'].includes(type)) return res.status(400).json({ message: 'Invalid type: must be "yes" or "no"' });
+  if (quantity <= 0) return res.status(400).json({ message: 'Quantity must be positive' });
 
   try {
     const data = await loadData();
@@ -214,26 +296,54 @@ app.post('/api/buy', async (req, res) => {
     const market = data.markets.find(m => m.id === marketId);
 
     if (!user || !market) return res.status(404).json({ message: 'User or Market not found' });
+    if (!user.tonWalletAddress) return res.status(400).json({ message: 'Wallet address not set' });
+    if (!tonTxHash) return res.status(400).json({ message: 'Payment transaction hash required' });
+
+    // TODO: Verify TON txHash via TON API (e.g., toncenter.com)
 
     const currentPrice = type === 'yes' ? market.yesPrice : market.noPrice;
-    if (offerPrice > currentPrice)
-      return res.status(400).json({ message: 'Offer price too high' });
+    if (offerPrice < currentPrice) {
+      return res.status(400).json({ 
+        message: 'Offer price too low (must be >= current price)', 
+        currentPrice,
+        offerPrice
+      });
+    }
 
-    const totalCost = offerPrice * quantity;
-    if (user.balance < totalCost)
-      return res.status(400).json({ message: 'Insufficient balance' });
+    const principalAmount = currentPrice * quantity;
+    const fee = calculateFee(principalAmount);
+    const totalCost = calculateTotalCost(principalAmount);
 
-    // Update user balance
-    user.balance -= totalCost;
+    await sendTelegramNotification(
+      `🛒 <b>НОВАЯ ПОКУПКА</b>\n\n` +
+      `👤 Пользователь: ${user.username}\n` +
+      `📊 Рынок: ${market.title}\n` +
+      `📈 Тип: ${type.toUpperCase()}\n` +
+      `🔢 Количество: ${quantity}\n` +
+      `💰 Сумма: ${totalCost.toFixed(2)} USD\n` +
+      `📝 TX Hash: ${tonTxHash}\n` +
+      `👛 Кошелек: ${user.tonWalletAddress}`
+    );
 
-    // Create or update position
+    const newPrices = updateMarketPrices(market, type, quantity);
+    
+    market.previousYesPrice = market.yesPrice;
+    market.previousNoPrice = market.noPrice;
+    market.yesPrice = newPrices.newYesPrice;
+    market.noPrice = newPrices.newNoPrice;
+    market.totalVolume += quantity;
+    market.volume24h += quantity;
+    market.volatility = (market.volatility * 0.9) + (Math.abs(newPrices.priceImpact) * 0.1);
+
     let position = data.positions.find(p => p.userId === userId && p.marketId === marketId && p.type === type);
+
     if (position) {
-      const oldTotal = position.purchasePrice * position.quantity;
-      const newTotal = oldTotal + totalCost;
-      position.purchasePrice = newTotal / (position.quantity + quantity);
+      const oldInvestment = position.purchasePrice * position.quantity;
+      const newInvestment = currentPrice * quantity;
+      position.purchasePrice = (oldInvestment + newInvestment) / (position.quantity + quantity);
       position.quantity += quantity;
       position.currentPrice = currentPrice;
+      position.updatedAt = new Date().toISOString();
     } else {
       position = {
         id: generateId(),
@@ -241,57 +351,68 @@ app.post('/api/buy', async (req, res) => {
         marketId,
         type,
         quantity,
-        purchasePrice: offerPrice,
-        currentPrice,
-        purchaseDate: new Date().toISOString().split('T')[0],
+        purchasePrice: currentPrice,
+        currentPrice: currentPrice,
+        totalInvested: principalAmount,
+        totalFees: fee,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       };
       data.positions.push(position);
     }
 
-    // Log transaction
-    data.transactions.push({
-      id: generateId(),
-      userId,
-      marketId,
-      type: 'buy',
-      contractType: type,
-      quantity,
-      price: offerPrice,
-      totalCost,
-      timestamp: new Date().toISOString(),
-    });
-
-    // Update market prices and add to price history
-    if (type === 'yes') {
-      market.previousYesPrice = market.yesPrice;
-      market.yesPrice = Math.min(0.99, market.yesPrice + 0.01);
-      market.noPrice = 1 - market.yesPrice;
-      market.previousNoPrice = market.noPrice;
-    } else {
-      market.previousNoPrice = market.noPrice;
-      market.noPrice = Math.min(0.99, market.noPrice + 0.01);
-      market.yesPrice = 1 - market.noPrice;
-      market.previousYesPrice = market.yesPrice;
-    }
-    if (!market.priceHistory) market.priceHistory = [];
     market.priceHistory.push({
       timestamp: new Date().toISOString(),
       yesPrice: market.yesPrice,
       noPrice: market.noPrice,
+      volume: quantity,
+      priceImpact: newPrices.priceImpact,
+      transactionType: 'buy'
     });
 
-    // Save updated data
+    const transaction = {
+      id: generateId(),
+      userId,
+      type: 'deposit',
+      status: 'completed',
+      amount: totalCost,
+      currency: 'USDT',
+      fromAddress: user.tonWalletAddress,
+      toAddress: data.system.adminWallet,
+      txHash: tonTxHash,
+      createdAt: new Date().toISOString(),
+      metadata: {
+        marketId,
+        contractType: type,
+        quantity
+      }
+    };
+    data.transactions.push(transaction);
+
     await saveData(data);
 
-    res.json({ message: 'Buy successful', position });
+    res.json({
+      message: 'Buy order placed successfully',
+      position,
+      transaction,
+      marketUpdate: {
+        newYesPrice: market.yesPrice,
+        newNoPrice: market.noPrice,
+        priceImpact: newPrices.priceImpact
+      }
+    });
+
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
-// Sell Contract
-app.post('/api/sell', async (req, res) => {
-  const { userId, positionId, quantity, sellPrice } = req.body;
+// --- Sell Request ---
+app.post('/api/sell/request', async (req, res) => {
+  const { userId, positionId, quantity, minPrice } = req.body;
+
+  // Валидация
+  if (quantity <= 0) return res.status(400).json({ message: 'Quantity must be positive' });
 
   try {
     const data = await loadData();
@@ -307,208 +428,252 @@ app.post('/api/sell', async (req, res) => {
       return res.status(400).json({ message: 'Insufficient quantity' });
 
     const currentPrice = position.type === 'yes' ? market.yesPrice : market.noPrice;
-    if (sellPrice < currentPrice)
-      return res.status(400).json({ message: 'Sell price too low' });
-
-    const totalRevenue = sellPrice * quantity;
-
-    // Update user balance
-    user.balance += totalRevenue;
-
-    // Update position
-    position.quantity -= quantity;
-    if (position.quantity <= 0) {
-      data.positions = data.positions.filter(p => p.id !== positionId);
+    if (minPrice > currentPrice) {
+      return res.status(400).json({ 
+        message: 'Min price higher than current price', 
+        currentPrice,
+        minPrice
+      });
     }
 
-    // Log transaction
-    data.transactions.push({
+    const principalAmount = currentPrice * quantity;
+    const fee = calculateFee(principalAmount);
+    const netProceeds = principalAmount - fee;
+
+    const pendingSells = await loadPendingSells();
+    const sellRequest = {
       id: generateId(),
       userId,
+      positionId,
       marketId: position.marketId,
-      type: 'sell',
       contractType: position.type,
       quantity,
-      price: sellPrice,
-      totalCost: -totalRevenue,
-      timestamp: new Date().toISOString(),
+      requestedPrice: currentPrice,
+      minPrice,
+      principalAmount,
+      fee,
+      netProceeds,
+      userWallet: user.tonWalletAddress,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      marketTitle: market.title,
+      username: user.username
+    };
+
+    pendingSells.push(sellRequest);
+    await savePendingSells(pendingSells);
+
+    await sendTelegramNotification(
+      `💰 <b>ЗАПРОС НА ПРОДАЖУ</b>\n\n` +
+      `👤 Пользователь: ${user.username}\n` +
+      `📊 Рынок: ${market.title}\n` +
+      `📈 Тип: ${position.type.toUpperCase()}\n` +
+      `🔢 Количество: ${quantity}\n` +
+      `💵 Цена: ${currentPrice.toFixed(4)}\n` +
+      `📉 Min цена: ${minPrice}\n` +
+      `💸 Выручка: ${netProceeds.toFixed(2)} USD\n` +
+      `👛 Кошелек: ${user.tonWalletAddress}\n\n` +
+      `🆔 ID: ${sellRequest.id}\n\n` +
+      `✅ Для подтверждения: /confirm_sell_${sellRequest.id}\n` +
+      `❌ Для отмены: /cancel_sell_${sellRequest.id}`
+    );
+
+    res.json({
+      message: 'Sell request submitted. Waiting for admin confirmation.',
+      requestId: sellRequest.id,
+      status: 'pending'
     });
 
-    // Update market prices and add to price history
-    if (position.type === 'yes') {
-      market.previousYesPrice = market.yesPrice;
-      market.yesPrice = Math.max(0.01, market.yesPrice - 0.01);
-      market.noPrice = 1 - market.yesPrice;
-      market.previousNoPrice = market.noPrice;
-    } else {
-      market.previousNoPrice = market.noPrice;
-      market.noPrice = Math.max(0.01, market.noPrice - 0.01);
-      market.yesPrice = 1 - market.noPrice;
-      market.previousYesPrice = market.yesPrice;
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// --- Confirm Sell ---
+app.post('/api/sell/confirm/:requestId', async (req, res) => {
+  const { requestId } = req.params;
+  const { adminSignature } = req.body;
+
+  try {
+    const pendingSells = await loadPendingSells();
+    const sellRequest = pendingSells.find(req => req.id === requestId);
+    
+    if (!sellRequest) return res.status(404).json({ message: 'Sell request not found' });
+    if (sellRequest.status !== 'pending') return res.status(400).json({ message: 'Request already processed' });
+    if (!adminSignature) return res.status(400).json({ message: 'Admin signature required' });
+
+    const data = await loadData();
+    const position = data.positions.find(p => p.id === sellRequest.positionId);
+    const user = data.users.find(u => u.id === sellRequest.userId);
+    const market = data.markets.find(m => m.id === sellRequest.marketId);
+
+    if (!position || !user || !market) return res.status(404).json({ message: 'Related data not found' });
+
+    // Проверяем, не упала ли цена ниже minPrice на момент confirm
+    const currentPrice = sellRequest.contractType === 'yes' ? market.yesPrice : market.noPrice;
+    if (currentPrice < sellRequest.minPrice) {
+      return res.status(400).json({ 
+        message: 'Current price below minPrice', 
+        currentPrice,
+        minPrice: sellRequest.minPrice
+      });
     }
-    if (!market.priceHistory) market.priceHistory = [];
+
+    const newPrices = updateMarketPrices(market, sellRequest.contractType, -sellRequest.quantity);
+    
+    market.previousYesPrice = market.yesPrice;
+    market.previousNoPrice = market.noPrice;
+    market.yesPrice = newPrices.newYesPrice;
+    market.noPrice = newPrices.newNoPrice;
+    market.totalVolume += sellRequest.quantity;
+    market.volume24h += sellRequest.quantity;
+
+    position.quantity -= sellRequest.quantity;
+    position.currentPrice = sellRequest.requestedPrice;
+    position.updatedAt = new Date().toISOString();
+    
+    if (position.quantity <= 0) {
+      data.positions = data.positions.filter(p => p.id !== sellRequest.positionId);
+    }
+
     market.priceHistory.push({
       timestamp: new Date().toISOString(),
       yesPrice: market.yesPrice,
       noPrice: market.noPrice,
+      volume: sellRequest.quantity,
+      priceImpact: newPrices.priceImpact,
+      transactionType: 'sell'
     });
 
-    // Save updated data
-    await saveData(data);
+    const transaction = {
+      id: generateId(),
+      userId: sellRequest.userId,
+      type: 'payout',
+      status: 'completed',
+      amount: sellRequest.netProceeds,
+      currency: 'USDT',
+      fromAddress: data.system.adminWallet,
+      toAddress: user.tonWalletAddress,
+      txHash: `payout_${generateId()}`, // TODO: Заменить на реальный хэш после отправки в TON
+      createdAt: new Date().toISOString(),
+      confirmedAt: new Date().toISOString(),
+      metadata: {
+        marketId: sellRequest.marketId,
+        contractType: sellRequest.contractType,
+        quantity: sellRequest.quantity,
+        positionId: sellRequest.positionId,
+        adminSignature
+      }
+    };
+    data.transactions.push(transaction);
 
-    res.json({ message: 'Sell successful', position });
+    sellRequest.status = 'completed';
+    sellRequest.completedAt = new Date().toISOString();
+    sellRequest.adminSignature = adminSignature;
+
+    await saveData(data);
+    await savePendingSells(pendingSells.filter(req => req.id !== requestId));
+
+    await sendTelegramNotification(
+      `✅ <b>ПРОДАЖА ПОДТВЕРЖДЕНА</b>\n\n` +
+      `🆔 ID: ${requestId}\n` +
+      `👤 Пользователь: ${user.username}\n` +
+      `💸 Выплачено: ${sellRequest.netProceeds.toFixed(2)} USD\n` +
+      `👛 На кошелек: ${user.tonWalletAddress}`
+    );
+
+    res.json({
+      message: 'Sell confirmed successfully',
+      transaction,
+      payout: {
+        amount: sellRequest.netProceeds,
+        wallet: user.tonWalletAddress
+      }
+    });
+
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
-// Get Monthly Performance Data based on real transactions
+// --- Cancel Sell (ДОБАВЛЕН) ---
+app.post('/api/sell/cancel/:requestId', async (req, res) => {
+  const { requestId } = req.params;
+  const { adminSignature } = req.body;
+
+  try {
+    if (!adminSignature) return res.status(400).json({ message: 'Admin signature required' });
+
+    const pendingSells = await loadPendingSells();
+    const sellRequestIndex = pendingSells.findIndex(req => req.id === requestId);
+    
+    if (sellRequestIndex === -1) return res.status(404).json({ message: 'Sell request not found' });
+    if (pendingSells[sellRequestIndex].status !== 'pending') return res.status(400).json({ message: 'Request already processed' });
+
+    const sellRequest = pendingSells[sellRequestIndex];
+    sellRequest.status = 'cancelled';
+    sellRequest.cancelledAt = new Date().toISOString();
+    sellRequest.adminSignature = adminSignature;
+
+    await savePendingSells(pendingSells);
+
+    const data = await loadData();
+    const user = data.users.find(u => u.id === sellRequest.userId);
+    await sendTelegramNotification(
+      `❌ <b>ПРОДАЖА ОТМЕНЕНА</b>\n\n` +
+      `🆔 ID: ${requestId}\n` +
+      `👤 Пользователь: ${user?.username || 'Unknown'}\n` +
+      `📊 Рынок: ${sellRequest.marketTitle}`
+    );
+
+    res.json({ message: 'Sell request cancelled successfully' });
+
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// --- Monthly Performance (ИСПРАВЛЕН: по последним 12 месяцам) ---
 app.get('/api/user/:userId/monthly-performance', async (req, res) => {
   try {
     const data = await loadData();
     const userId = req.params.userId;
-    
-    // Получаем все транзакции пользователя
-    const userTransactions = data.transactions.filter(t => t.userId === userId);
+    const userTransactions = data.transactions.filter(t => t.userId === userId && t.status === 'completed');
     
     if (userTransactions.length === 0) {
-      // Если нет транзакций, возвращаем нулевые данные
-      const emptyData = [
-        { month: 'Янв', value: 0 },
-        { month: 'Фев', value: 0 },
-        { month: 'Мар', value: 0 },
-        { month: 'Апр', value: 0 },
-        { month: 'Май', value: 0 },
-        { month: 'Июн', value: 0 },
-        { month: 'Июл', value: 0 },
-        { month: 'Авг', value: 0 },
-        { month: 'Сен', value: 0 },
-        { month: 'Окт', value: 0 },
-        { month: 'Ноя', value: 0 },
-        { month: 'Дек', value: 0 },
-      ];
+      const months = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+      const emptyData = months.map(month => ({ month, value: 0 }));
       return res.json(emptyData);
     }
     
-    // Группируем транзакции по месяцам
+    // Группировка по последним 12 месяцам
+    const now = new Date();
     const monthlyPerformance = {};
-    const months = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+    for (let i = 11; i >= 0; i--) {
+      const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      monthlyPerformance[monthKey] = 0;
+    }
     
-    // Инициализируем все месяцы нулями
-    months.forEach(month => {
-      monthlyPerformance[month] = 0;
-    });
-    
-    // Обрабатываем каждую транзакцию
     userTransactions.forEach(transaction => {
-      const date = new Date(transaction.timestamp);
-      const monthIndex = date.getMonth();
-      const monthName = months[monthIndex];
-      
-      if (transaction.type === 'buy') {
-        // Покупка - отрицательное влияние на баланс
-        monthlyPerformance[monthName] -= transaction.totalCost;
-      } else if (transaction.type === 'sell') {
-        // Продажа - положительное влияние на баланс
-        monthlyPerformance[monthName] += Math.abs(transaction.totalCost);
-      }
-    });
-    
-    // Преобразуем в массив для графика
-    const chartData = months.map(month => ({
-      month,
-      value: Math.round(monthlyPerformance[month] * 100) / 100
-    }));
-    
-    res.json(chartData);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
-
-// Get Portfolio Value Over Time
-app.get('/api/user/:userId/portfolio-value', async (req, res) => {
-  try {
-    const data = await loadData();
-    const userId = req.params.userId;
-    
-    // Получаем все позиции пользователя
-    const userPositions = data.positions.filter(pos => pos.userId === userId);
-    
-    if (userPositions.length === 0) {
-      return res.json([]);
-    }
-    
-    // Собираем все уникальные даты из истории цен всех рынков
-    const allDates = new Set();
-    
-    userPositions.forEach(position => {
-      const market = data.markets.find(m => m.id === position.marketId);
-      if (market && market.priceHistory) {
-        market.priceHistory.forEach(ph => {
-          const date = new Date(ph.timestamp).toISOString().split('T')[0];
-          allDates.add(date);
-        });
-      }
-    });
-    
-    // Сортируем даты
-    const sortedDates = Array.from(allDates).sort();
-    
-    // Рассчитываем стоимость портфеля для каждой даты
-    const portfolioValue = sortedDates.map(date => {
-      let totalValue = 0;
-      
-      userPositions.forEach(position => {
-        const market = data.markets.find(m => m.id === position.marketId);
-        if (market && market.priceHistory) {
-          // Находим ближайшую историческую цену к этой дате
-          const pricePoint = market.priceHistory
-            .filter(ph => new Date(ph.timestamp).toISOString().split('T')[0] <= date)
-            .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
-          
-          if (pricePoint) {
-            const price = position.type === 'yes' ? pricePoint.yesPrice : pricePoint.noPrice;
-            totalValue += price * position.quantity;
-          }
+      const date = new Date(transaction.createdAt);
+      const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+      if (monthlyPerformance[monthKey] !== undefined) {
+        if (transaction.type === 'deposit') {
+          monthlyPerformance[monthKey] -= transaction.amount;
+        } else if (transaction.type === 'payout') {
+          monthlyPerformance[monthKey] += transaction.amount;
         }
-      });
-      
-      return {
-        date,
-        value: Math.round(totalValue * 100) / 100
-      };
+      }
     });
     
-    res.json(portfolioValue);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
-
-// Get Market Price History for Specific Market
-app.get('/api/market/:marketId/price-history-chart', async (req, res) => {
-  try {
-    const data = await loadData();
-    const market = data.markets.find(m => m.id === req.params.marketId);
-    
-    if (!market) {
-      return res.status(404).json({ message: 'Market not found' });
-    }
-    
-    if (!market.priceHistory || market.priceHistory.length === 0) {
-      return res.json([]);
-    }
-    
-    // Преобразуем историю цен в формат для графика
-    const chartData = market.priceHistory.map(ph => {
-      const date = new Date(ph.timestamp);
+    const months = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+    const chartData = Object.keys(monthlyPerformance).sort().map(key => {
+      const [year, monthNum] = key.split('-');
+      const monthIndex = parseInt(monthNum) - 1;
       return {
-        timestamp: ph.timestamp,
-        date: date.toLocaleDateString('ru-RU'),
-        yesPrice: Math.round(ph.yesPrice * 100) / 100,
-        noPrice: Math.round(ph.noPrice * 100) / 100,
-        month: date.toLocaleString('ru-RU', { month: 'short' })
+        month: months[monthIndex],
+        value: Math.round(monthlyPerformance[key] * 100) / 100
       };
     });
     
@@ -518,58 +683,7 @@ app.get('/api/market/:marketId/price-history-chart', async (req, res) => {
   }
 });
 
-// Get User Balance History
-app.get('/api/user/:userId/balance-history', async (req, res) => {
-  try {
-    const data = await loadData();
-    const userId = req.params.userId;
-    
-    const userTransactions = data.transactions
-      .filter(t => t.userId === userId)
-      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    
-    if (userTransactions.length === 0) {
-      return res.json([]);
-    }
-    
-    let currentBalance = data.users.find(u => u.id === userId)?.balance || 0;
-    const balanceHistory = [];
-    
-    // Восстанавливаем историю баланса от последней транзакции к первой
-    for (let i = userTransactions.length - 1; i >= 0; i--) {
-      const transaction = userTransactions[i];
-      
-      if (transaction.type === 'buy') {
-        currentBalance += transaction.totalCost; // Откатываем покупку
-      } else if (transaction.type === 'sell') {
-        currentBalance -= Math.abs(transaction.totalCost); // Откатываем продажу
-      }
-      
-      balanceHistory.unshift({
-        timestamp: transaction.timestamp,
-        date: new Date(transaction.timestamp).toLocaleDateString('ru-RU'),
-        balance: Math.round(currentBalance * 100) / 100,
-        transactionType: transaction.type
-      });
-    }
-    
-    // Добавляем текущий баланс
-    if (balanceHistory.length > 0) {
-      balanceHistory.push({
-        timestamp: new Date().toISOString(),
-        date: new Date().toLocaleDateString('ru-RU'),
-        balance: data.users.find(u => u.id === userId)?.balance || 0,
-        transactionType: 'current'
-      });
-    }
-    
-    res.json(balanceHistory);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
-
-// Start server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+  await initializeData(); // Инициализация при старте
   console.log(`Server running on port ${PORT}`);
 });

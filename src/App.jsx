@@ -6,7 +6,7 @@ import TradeInterfaceBlue from './TradingCard';
 import CommentSection from './CommentsSection';
 import OrderBook from './InfoCard';
 
-const manifestUrl = 'https://your-site.com/tonconnect-manifest.json';
+const manifestUrl = 'https://localhost:5173/public/tonconnect-manifest.json';
 
 function App() {
   return (

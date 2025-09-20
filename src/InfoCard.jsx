@@ -108,51 +108,122 @@ const UpdateIndicator = styled.span`
   }
 `;
 
-const OrderBook = () => {
+const OrderBook = ({
+  marketId = '1',
+  autoRefreshInterval = 4000,
+  showDescription = true,
+  showEventInfo = true,
+  onMarketUpdate,
+  compact = false,
+}) => {
   const [outcomes, setOutcomes] = useState([]);
   const [lastUpdated, setLastUpdated] = useState(new Date());
   const [isUpdating, setIsUpdating] = useState(false);
   const [market, setMarket] = useState(null);
-
-  const marketId = '1'; // Assume the market ID, replace with dynamic if needed
+  const [error, setError] = useState(null);
 
   const fetchMarketData = async () => {
     setIsUpdating(true);
+    setError(null);
     try {
       const response = await axios.get(`http://localhost:5000/api/market/${marketId}`);
       const marketData = response.data;
       setMarket(marketData);
-      setOutcomes([
+
+      // Верификация данных
+      if (!marketData.id || typeof marketData.yesPrice !== 'number' || typeof marketData.noPrice !== 'number') {
+        throw new Error('Invalid market data structure');
+      }
+
+      // Проверка статуса рынка (учитывая текущую дату: 2025-09-20)
+      const currentDate = new Date('2025-09-20');
+      const endDate = marketData.endDate ? new Date(marketData.endDate) : null;
+      if (endDate && currentDate > endDate && marketData.status !== 'resolved') {
+        console.warn('Market may need resolution check');
+      }
+
+      // Вычисление изменений коэффициентов
+      const prevYesCoeff = 1 / (marketData.previousYesPrice || marketData.yesPrice);
+      const yesCoeffChange = marketData.yesCoefficient - prevYesCoeff;
+      const yesAbsChange = Math.abs(parseFloat(yesCoeffChange.toFixed(4)));
+      const yesTrend = yesCoeffChange > 0 ? 'up' : 'down';
+
+      const prevNoCoeff = 1 / (marketData.previousNoPrice || marketData.noPrice);
+      const noCoeffChange = marketData.noCoefficient - prevNoCoeff;
+      const noAbsChange = Math.abs(parseFloat(noCoeffChange.toFixed(4)));
+      const noTrend = noCoeffChange > 0 ? 'up' : 'down';
+
+      const newOutcomes = [
         { 
           id: 'yes', 
           outcome: 'Да', 
           price: marketData.yesCoefficient, 
-          change: marketData.yesChange, 
-          trend: marketData.yesTrend 
+          change: yesAbsChange, 
+          trend: yesTrend 
         },
         { 
           id: 'no', 
           outcome: 'Нет', 
           price: marketData.noCoefficient, 
-          change: marketData.noChange, 
-          trend: marketData.noTrend 
+          change: noAbsChange, 
+          trend: noTrend 
         }
-      ]);
+      ];
+
+      setOutcomes(newOutcomes);
       setLastUpdated(new Date());
+
+      if (onMarketUpdate) {
+        onMarketUpdate(marketData);
+      }
     } catch (err) {
       console.error('Failed to fetch market data:', err);
+      setError(err.message);
+    } finally {
+      setIsUpdating(false);
     }
-    setIsUpdating(false);
   };
 
   useEffect(() => {
     fetchMarketData(); // Initial fetch
-    const interval = setInterval(fetchMarketData, 4000);
-    return () => clearInterval(interval);
-  }, []);
+    if (autoRefreshInterval > 0) {
+      const interval = setInterval(fetchMarketData, autoRefreshInterval);
+      return () => clearInterval(interval);
+    }
+  }, [marketId, autoRefreshInterval]);
+
+  if (error) {
+    return (
+      <Container>
+        <p>Error: {error}</p>
+      </Container>
+    );
+  }
+
+  if (!market) {
+    return (
+      <Container>
+        <p>Loading...</p>
+      </Container>
+    );
+  }
+
+  // Если рынок resolved, показать предупреждение
+  if (market.resolved) {
+    return (
+      <Container>
+        <Title>Рынок завершён</Title>
+        <EventInfo>
+          <p>Разрешение: {market.resolution || 'Не определено'}</p>
+        </EventInfo>
+      </Container>
+    );
+  }
 
   return (
     <Container>
+      <Title>Коэффициенты исходов</Title>
+      
       <OutcomesTable>
         <thead>
           <tr>
@@ -171,7 +242,7 @@ const OrderBook = () => {
                   color: item.outcome === 'Да' ? '#52c41a' : '#ff4d4f',
                   fontSize: '16px'
                 }}>
-                  {item.price}x
+                  {item.price.toFixed(2)}x
                 </span>
               </TableCell>
               <TableCell>
@@ -181,7 +252,7 @@ const OrderBook = () => {
                   ) : (
                     <FallOutlined style={{ marginRight: 4 }} />
                   )}
-                  {item.change}x
+                  {item.change.toFixed(4)}x
                 </PriceChange>
               </TableCell>
             </tr>
@@ -189,24 +260,42 @@ const OrderBook = () => {
         </tbody>
       </OutcomesTable>
       
-      <EventInfo>
-        <p style={{ margin: '0 0 8px 0', fontWeight: '500' }}>
-          Событие: {market?.title || 'Loading...'}
-        </p>
-        <p style={{ margin: 0, color: '#666' }}>
-          Текущие коэффициенты и изменения за последний период. 
-          Данные обновляются автоматически каждые 4 секунды.
-        </p>
-        <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#999' }}>
-          Обновлено: {lastUpdated.toLocaleTimeString()}
-        </p>
-      </EventInfo>
+      {showEventInfo && (
+        <EventInfo>
+          <p style={{ margin: '0 0 8px 0', fontWeight: '500' }}>
+            Событие: {market.title}
+            <UpdateIndicator updating={isUpdating}>
+              {isUpdating ? 'Обновление...' : ''}
+            </UpdateIndicator>
+          </p>
+          <p style={{ margin: 0, color: '#666' }}>
+            Текущие коэффициенты и изменения за последний период. 
+            Данные обновляются автоматически каждые {autoRefreshInterval / 1000} секунды.
+          </p>
+          <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#999' }}>
+            Обновлено: {lastUpdated.toLocaleTimeString()}
+          </p>
+        </EventInfo>
+      )}
       
-      <LegendSection>
-        <p style={{ margin: 0, lineHeight: 1.5, color: '#555' }}>
-          {market?.description || 'Loading description...'}
-        </p>
-      </LegendSection>
+      {showDescription && (
+        <LegendSection>
+          <Subtitle>Описание события</Subtitle>
+          <p style={{ margin: 0, lineHeight: 1.5, color: '#555' }}>
+            {market.description || 'Описание отсутствует.'}
+          </p>
+          {market.endDate && (
+            <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#999' }}>
+              Завершение: {new Date(market.endDate).toLocaleDateString('ru-RU')}
+            </p>
+          )}
+          {market.status && (
+            <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: market.status === 'active' ? '#52c41a' : '#ff4d4f' }}>
+              Статус: {market.status}
+            </p>
+          )}
+        </LegendSection>
+      )}
     </Container>
   );
 };

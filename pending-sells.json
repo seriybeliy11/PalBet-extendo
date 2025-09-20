@@ -1,0 +1,19 @@
+[
+  {
+    "id": "e903b60db",
+    "userId": "1",
+    "positionId": "e81lgzc4n",
+    "marketId": "1",
+    "contractType": "no",
+    "quantity": 14,
+    "requestedPrice": 0.38,
+    "minPrice": 0.38,
+    "principalAmount": 5.32,
+    "fee": 0.10640000000000001,
+    "netProceeds": 5.2136000000000005,
+    "status": "pending",
+    "createdAt": "2025-09-20T14:45:47.344Z",
+    "marketTitle": "Будет ли мирное соглашение в 2025 году?",
+    "username": "testuser"
+  }
+]
