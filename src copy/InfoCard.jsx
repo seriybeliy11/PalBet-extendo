@@ -1,12 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { RiseOutlined, FallOutlined } from '@ant-design/icons';
 import styled from 'styled-components';
-import { createClient } from '@supabase/supabase-js';
-
-// Инициализация Supabase клиента
-const supabaseUrl = 'https://dlwjjtvrtdohtfxsrcbd.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRsd2pqdHZydGRvaHRmeHNyY2JkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg0MDQxNTQsImV4cCI6MjA3Mzk4MDE1NH0.eLbGiCej5jwJ5-NKRgCBhLsE9Q0fz8pFbpiadE-Cwe8';
-const supabase = createClient(supabaseUrl, supabaseKey);
+import axios from 'axios';
 
 const Container = styled.div`
   padding: 0;
@@ -130,123 +125,57 @@ const OrderBook = ({
   const fetchMarketData = async () => {
     setIsUpdating(true);
     setError(null);
-    
     try {
-      // 1. Получаем информацию о рынке
-      const { data: marketData, error: marketError } = await supabase
-        .from('markets')
-        .select('*')
-        .eq('id', marketId)
-        .single();
+      const response = await axios.get(`http://localhost:5000/api/market/${marketId}`);
+      const marketData = response.data;
+      setMarket(marketData);
 
-      if (marketError) throw marketError;
+      // Верификация данных
+      if (!marketData.id || typeof marketData.yesPrice !== 'number' || typeof marketData.noPrice !== 'number') {
+        throw new Error('Invalid market data structure');
+      }
 
-      // 2. Получаем текущие цены для "Да"
-      const { data: yesOrders, error: yesError } = await supabase
-        .from('orders')
-        .select('price')
-        .eq('market_id', marketId)
-        .eq('outcome', 'yes')
-        .eq('order_type', 'buy')
-        .eq('status', 'active');
+      // Проверка статуса рынка (учитывая текущую дату: 2025-09-20)
+      const currentDate = new Date('2025-09-20');
+      const endDate = marketData.endDate ? new Date(marketData.endDate) : null;
+      if (endDate && currentDate > endDate && marketData.status !== 'resolved') {
+        console.warn('Market may need resolution check');
+      }
 
-      if (yesError) throw yesError;
-
-      // 3. Получаем текущие цены для "Нет"
-      const { data: noOrders, error: noError } = await supabase
-        .from('orders')
-        .select('price')
-        .eq('market_id', marketId)
-        .eq('outcome', 'no')
-        .eq('order_type', 'buy')
-        .eq('status', 'active');
-
-      if (noError) throw noError;
-
-      // 4. Получаем исторические цены для "Да" (за последний час)
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-      const { data: yesTrades, error: yesTradesError } = await supabase
-        .from('trades')
-        .select('price')
-        .eq('market_id', marketId)
-        .eq('outcome', 'yes')
-        .lt('timestamp', oneHourAgo);
-
-      if (yesTradesError) throw yesTradesError;
-
-      // 5. Получаем исторические цены для "Нет" (за последний час)
-      const { data: noTrades, error: noTradesError } = await supabase
-        .from('trades')
-        .select('price')
-        .eq('market_id', marketId)
-        .eq('outcome', 'no')
-        .lt('timestamp', oneHourAgo);
-
-      if (noTradesError) throw noTradesError;
-
-      // Вычисляем средние цены
-      const calculateAverage = (data, defaultValue = 0.5) => {
-        if (!data || data.length === 0) return defaultValue;
-        const sum = data.reduce((acc, item) => acc + Number(item.price), 0);
-        return sum / data.length;
-      };
-
-      const yesPrice = calculateAverage(yesOrders);
-      const noPrice = calculateAverage(noOrders);
-      const previousYesPrice = calculateAverage(yesTrades);
-      const previousNoPrice = calculateAverage(noTrades);
-
-      // Вычисляем коэффициенты
-      const yesCoefficient = Number((1 / (yesPrice || 1)).toFixed(2));
-      const noCoefficient = Number((1 / (noPrice || 1)).toFixed(2));
-
-      // Вычисляем изменения
-      const prevYesCoeff = 1 / (previousYesPrice || yesPrice);
-      const yesCoeffChange = yesCoefficient - prevYesCoeff;
+      // Вычисление изменений коэффициентов
+      const prevYesCoeff = 1 / (marketData.previousYesPrice || marketData.yesPrice);
+      const yesCoeffChange = marketData.yesCoefficient - prevYesCoeff;
       const yesAbsChange = Math.abs(parseFloat(yesCoeffChange.toFixed(4)));
       const yesTrend = yesCoeffChange > 0 ? 'up' : 'down';
 
-      const prevNoCoeff = 1 / (previousNoPrice || noPrice);
-      const noCoeffChange = noCoefficient - prevNoCoeff;
+      const prevNoCoeff = 1 / (marketData.previousNoPrice || marketData.noPrice);
+      const noCoeffChange = marketData.noCoefficient - prevNoCoeff;
       const noAbsChange = Math.abs(parseFloat(noCoeffChange.toFixed(4)));
       const noTrend = noCoeffChange > 0 ? 'up' : 'down';
-
-      // Формируем данные для отображения
-      const marketInfo = {
-        ...marketData,
-        yesPrice,
-        noPrice,
-        yesCoefficient,
-        noCoefficient,
-        previousYesPrice,
-        previousNoPrice
-      };
 
       const newOutcomes = [
         { 
           id: 'yes', 
           outcome: 'Да', 
-          price: yesCoefficient, 
+          price: marketData.yesCoefficient, 
           change: yesAbsChange, 
           trend: yesTrend 
         },
         { 
           id: 'no', 
           outcome: 'Нет', 
-          price: noCoefficient, 
+          price: marketData.noCoefficient, 
           change: noAbsChange, 
           trend: noTrend 
         }
       ];
 
-      setMarket(marketInfo);
       setOutcomes(newOutcomes);
       setLastUpdated(new Date());
 
       if (onMarketUpdate) {
-        onMarketUpdate(marketInfo);
+        onMarketUpdate(marketData);
       }
-
     } catch (err) {
       console.error('Failed to fetch market data:', err);
       setError(err.message);
@@ -275,6 +204,18 @@ const OrderBook = ({
     return (
       <Container>
         <p>Loading...</p>
+      </Container>
+    );
+  }
+
+  // Если рынок resolved, показать предупреждение
+  if (market.resolved) {
+    return (
+      <Container>
+        <Title>Рынок завершён</Title>
+        <EventInfo>
+          <p>Разрешение: {market.resolution || 'Не определено'}</p>
+        </EventInfo>
       </Container>
     );
   }
@@ -322,7 +263,7 @@ const OrderBook = ({
       {showEventInfo && (
         <EventInfo>
           <p style={{ margin: '0 0 8px 0', fontWeight: '500' }}>
-            Событие: {market.name || market.title}
+            Событие: {market.title}
             <UpdateIndicator updating={isUpdating}>
               {isUpdating ? 'Обновление...' : ''}
             </UpdateIndicator>
@@ -343,14 +284,16 @@ const OrderBook = ({
           <p style={{ margin: 0, lineHeight: 1.5, color: '#555' }}>
             {market.description || 'Описание отсутствует.'}
           </p>
-          {market.end_date && (
+          {market.endDate && (
             <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#999' }}>
-              Завершение: {new Date(market.end_date).toLocaleDateString('ru-RU')}
+              Завершение: {new Date(market.endDate).toLocaleDateString('ru-RU')}
             </p>
           )}
-          <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: market.resolved ? '#ff4d4f' : '#52c41a' }}>
-            Статус: {market.resolved ? 'завершен' : 'активен'}
-          </p>
+          {market.status && (
+            <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: market.status === 'active' ? '#52c41a' : '#ff4d4f' }}>
+              Статус: {market.status}
+            </p>
+          )}
         </LegendSection>
       )}
     </Container>

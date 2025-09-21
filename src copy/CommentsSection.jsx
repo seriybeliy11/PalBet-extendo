@@ -1,68 +1,59 @@
 import React, { useState, useEffect } from 'react';
 import { Card, List, Avatar, Typography, Space, Button, Spin } from 'antd';
 import { MessageOutlined, ReloadOutlined } from '@ant-design/icons';
-import { createClient } from '@supabase/supabase-js';
-import moment from 'moment';
+import axios from 'axios';
+import moment from 'moment'; // For timestamp formatting, install if needed: npm i moment
 
 const { Text, Title } = Typography;
-
-// Инициализация Supabase клиента
-const supabaseUrl = 'https://dlwjjtvrtdohtfxsrcbd.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRsd2pqdHZydGRvaHRmeHNyY2JkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg0MDQxNTQsImV4cCI6MjA3Mzk4MDE1NH0.eLbGiCej5jwJ5-NKRgCBhLsE9Q0fz8pFbpiadE-Cwe8';
-const supabase = createClient(supabaseUrl, supabaseKey);
 
 const CommentSection = ({ marketId = '1' }) => {
   const [comments, setComments] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  // Функция для загрузки комментариев
   const fetchComments = async () => {
     setLoading(true);
     setError(null);
     try {
-      // Делаем запрос напрямую к Supabase
-      const { data, error: supabaseError } = await supabase
-        .from('comments')
-        .select(`
-          *,
-          user:user_id (
-            name,
-            wallet
-          )
-        `)
-        .eq('market_id', marketId)
-        .order('created_at', { ascending: false });
-
-      if (supabaseError) {
-        throw supabaseError;
+      // Supabase Edge Function endpoint with Authorization header
+      const response = await axios.get(`https://xgfxijjcebvgokwutcfx.supabase.co/functions/v1/fetch-comments`, {
+        headers: {
+          'Authorization': 'Bearer sbp_0e61ee801b49fb57e1a804b160165a7d1080477f',
+          'Content-Type': 'application/json'
+        }
+      });
+      const data = response.data;
+      
+      // Verify structure (assume data is array or data.comments)
+      let commentsData = Array.isArray(data) ? data : (data.comments || []);
+      if (Array.isArray(commentsData)) {
+        // Format timestamps if needed (backend may return ISO, convert to relative)
+        const formattedComments = commentsData.map(comment => ({
+          ...comment,
+          timestamp: moment(comment.timestamp || new Date()).fromNow() // e.g., "4 days ago"
+        }));
+        setComments(formattedComments);
+      } else {
+        throw new Error('Invalid comments data');
       }
-
-      // Форматируем данные для отображения
-      const formattedComments = (data || []).map(comment => ({
-        id: comment.id,
-        author: comment.user?.name || comment.user?.wallet || 'Аноним',
-        avatar: null, // Можно добавить поле avatar в таблицу users если нужно
-        content: comment.content,
-        likes: comment.likes,
-        isChannel: comment.is_channel,
-        timestamp: moment(comment.created_at).fromNow()
-      }));
-
-      setComments(formattedComments);
     } catch (err) {
-      console.error('Ошибка загрузки комментариев:', err);
-      setError('Не удалось загрузить комментарии.');
-      setComments([]);
+      console.error('Failed to fetch comments:', err);
+      setError('Failed to load comments from backend.');
+      setComments([]); // No fallback comments; rely only on endpoint
     } finally {
       setLoading(false);
     }
   };
 
-  // Загружаем комментарии только при первом рендере и смене marketId
   useEffect(() => {
-    fetchComments();
+    fetchComments(); // Initial load
+    const interval = setInterval(fetchComments, 300000); // Auto-refresh every 5 minutes
+    return () => clearInterval(interval);
   }, [marketId]);
+
+  const refreshComments = () => {
+    fetchComments();
+  };
 
   return (
     <Card
@@ -83,13 +74,13 @@ const CommentSection = ({ marketId = '1' }) => {
           <Space>
             <MessageOutlined style={{ color: 'white', fontSize: '18px' }} />
             <Title level={5} style={{ color: 'white', margin: 0 }}>
-              Комментарии
+              Комментарии из Telegram
             </Title>
           </Space>
           <Button 
             icon={<ReloadOutlined />} 
             size="small"
-            onClick={fetchComments}
+            onClick={refreshComments}
             loading={loading}
             style={{ color: 'white', borderColor: 'white' }}
           >
@@ -97,33 +88,28 @@ const CommentSection = ({ marketId = '1' }) => {
           </Button>
         </Space>
         <Text style={{ color: 'rgba(255, 255, 255, 0.8)', fontSize: '12px' }}>
-          Обсуждайте событие и делитесь прогнозами
+          Комментарии синхронизируются с Telegram-каналом в реальном времени
         </Text>
       </div>
 
       {/* Список комментариев */}
       <div style={{ maxHeight: '400px', overflowY: 'auto' }}>
-        {loading && comments.length === 0 ? (
+        {loading ? (
           <div style={{ padding: '40px', textAlign: 'center' }}>
             <Spin size="large" />
             <div style={{ marginTop: '16px' }}>
-              <Text type="secondary">Загрузка комментариев...</Text>
+              <Text type="secondary">Загрузка новых комментариев...</Text>
             </div>
           </div>
         ) : error ? (
           <div style={{ padding: '20px', textAlign: 'center', color: '#ff4d4f' }}>
             <Text type="danger">{error}</Text>
-            <br />
-            <Button size="small" onClick={fetchComments} style={{ marginTop: '10px' }}>
-              Попробовать снова
-            </Button>
           </div>
         ) : (
           <List
             dataSource={comments}
             renderItem={(item) => (
               <List.Item
-                key={item.id}
                 style={{ 
                   padding: '16px 24px',
                   borderBottom: '1px solid #f0f0f0',
@@ -133,10 +119,9 @@ const CommentSection = ({ marketId = '1' }) => {
                 <List.Item.Meta
                   avatar={
                     <Avatar 
+                      src={item.avatar} 
                       style={item.isChannel ? { border: '2px solid #1890ff' } : {}}
-                    >
-                      {item.author?.charAt(0).toUpperCase()}
-                    </Avatar>
+                    />
                   }
                   title={
                     <Space>
@@ -166,7 +151,6 @@ const CommentSection = ({ marketId = '1' }) => {
                 />
               </List.Item>
             )}
-            locale={{ emptyText: 'Пока нет комментариев. Будьте первым!' }}
           />
         )}
       </div>
@@ -179,7 +163,7 @@ const CommentSection = ({ marketId = '1' }) => {
         textAlign: 'center'
       }}>
         <Text type="secondary" style={{ fontSize: '12px' }}>
-          Нажмите "Обновить", чтобы увидеть новые комментарии
+          Комментарии обновляются автоматически каждые 5 минут
         </Text>
       </div>
     </Card>

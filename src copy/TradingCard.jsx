@@ -1,15 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { Button, Card, Space, Typography, Input, Slider, Divider, Modal, Tag, Alert } from 'antd';
-import { ShoppingCartOutlined, DollarOutlined } from '@ant-design/icons';
+import { ShoppingCartOutlined, DollarOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import styled from 'styled-components';
 import { createClient } from '@supabase/supabase-js';
-import { useTonConnectUI } from '@tonconnect/ui-react'; // Import TON Connect UI hook
 
 const { Title, Text } = Typography;
 
 // Supabase client initialization
-const supabaseUrl = 'https://dlwjjtvrtdohtfxsrcbd.supabase.co';
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRsd2pqdHZydGRvaHRmeHNyY2JkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg0MDQxNTQsImV4cCI6MjA3Mzk4MDE1NH0.eLbGiCej5jwJ5-NKRgCBhLsE9Q0fz8pFbpiadE-Cwe8';
+const supabaseUrl = process.env.REACT_APP_SUPABASE_URL;
+const supabaseKey = process.env.REACT_APP_SUPABASE_KEY;  // Здесь должен быть anon public ключ
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Styled components
@@ -92,6 +91,7 @@ const TradeInterfaceBlue = () => {
   const [betAmount, setBetAmount] = useState(1);
   const [modalVisible, setModalVisible] = useState(false);
   const [offerPrice, setOfferPrice] = useState(0.5);
+  const [tonTxHash, setTonTxHash] = useState('');
   const [sellAmount, setSellAmount] = useState(0);
   const [minPrice, setMinPrice] = useState(0);
   const [potentialProfit, setPotentialProfit] = useState(0);
@@ -105,10 +105,8 @@ const TradeInterfaceBlue = () => {
   const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
   const [orderBook, setOrderBook] = useState({ bids: [], asks: [] });
 
-  const [tonConnectUI] = useTonConnectUI(); // TON Connect UI hook
   const userId = 1; // Replace with actual user ID from auth system
   const marketId = 1; // Hardcoded for the single market
-  const platformWalletAddress = 'YOUR_PLATFORM_USDT_WALLET_ADDRESS'; // Replace with platform's USDT wallet address
 
   // Calculate total portfolio value
   useEffect(() => {
@@ -184,6 +182,7 @@ const TradeInterfaceBlue = () => {
       if (!prediction) return;
       
       try {
+        // Check if the RPC function exists, use fallback if not
         const { data, error } = await supabase
           .from('orders')
           .select('*')
@@ -198,6 +197,7 @@ const TradeInterfaceBlue = () => {
         setOrderBook({ bids, asks });
       } catch (err) {
         console.error('Failed to fetch order book:', err);
+        // Fallback to empty order book
         setOrderBook({ bids: [], asks: [] });
       }
     };
@@ -206,6 +206,7 @@ const TradeInterfaceBlue = () => {
 
   // Real-time subscriptions
   useEffect(() => {
+    // Subscribe to orders changes
     const ordersSubscription = supabase
       .channel('orders-changes')
       .on('postgres_changes', 
@@ -216,6 +217,7 @@ const TradeInterfaceBlue = () => {
           filter: `market_id=eq.${marketId}`
         }, 
         () => {
+          // Re-fetch order book when orders change
           if (prediction) {
             supabase
               .from('orders')
@@ -234,6 +236,7 @@ const TradeInterfaceBlue = () => {
       )
       .subscribe();
 
+    // Subscribe to positions changes
     const positionsSubscription = supabase
       .channel('positions-changes')
       .on('postgres_changes', 
@@ -244,6 +247,7 @@ const TradeInterfaceBlue = () => {
           filter: `user_id=eq.${userId}`
         }, 
         async () => {
+          // Re-fetch user positions
           const { data } = await supabase
             .from('positions')
             .select('*')
@@ -297,6 +301,7 @@ const TradeInterfaceBlue = () => {
       return (bestBid + bestAsk) / 2;
     }
     
+    // Fallback to market prices
     if (!market) return 0.5;
     return prediction === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
   };
@@ -306,75 +311,50 @@ const TradeInterfaceBlue = () => {
       setError('Please set your wallet address first');
       return;
     }
-    if (!tonConnectUI) {
-      setError('TON Connect is not initialized');
+    if (!tonTxHash) {
+      setError('Transaction hash is required');
       return;
     }
 
     try {
-      // Calculate total cost in USDT
-      const totalCost = (getCurrentPrice() * betAmount).toFixed(2);
-
-      // Call the Edge function to prepare the USDT transaction
-      const response = await fetch('/api/prepare-usdt-transfer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipientAddress: platformWalletAddress,
-          amount: totalCost,
-          userAddress: user.wallet
+      // First create an order
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .insert({
+          user_id: userId,
+          market_id: marketId,
+          outcome: prediction,
+          order_type: 'buy',
+          price: getCurrentPrice(),
+          shares: betAmount,
+          status: 'pending'
         })
-      });
+        .select();
 
-      if (!response.ok) {
-        throw new Error('Failed to prepare transaction');
-      }
+      if (orderError) throw orderError;
 
-      const transaction = await response.json();
+      setSuccess('Buy order placed successfully!');
+      setError(null);
+      
+      // Refresh data
+      const { data: positionsData } = await supabase
+        .from('positions')
+        .select('*')
+        .eq('user_id', userId);
+      setPurchasedContracts(positionsData || []);
+      
+      // Refresh user balance
+      const { data: userData } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', userId)
+        .single();
+      setUser(userData);
 
-      // Send transaction to TON Connect for signing
-      const result = await tonConnectUI.sendTransaction(transaction);
-
-      // If transaction is signed and sent successfully
-      if (result.boc) {
-        // Create an order in Supabase
-        const { data: orderData, error: orderError } = await supabase
-          .from('orders')
-          .insert({
-            user_id: userId,
-            market_id: marketId,
-            outcome: prediction,
-            order_type: 'buy',
-            price: getCurrentPrice(),
-            shares: betAmount,
-            status: 'pending'
-          })
-          .select();
-
-        if (orderError) throw orderError;
-
-        setSuccess('Buy order placed successfully!');
-        setError(null);
-
-        // Refresh positions
-        const { data: positionsData } = await supabase
-          .from('positions')
-          .select('*')
-          .eq('user_id', userId);
-        setPurchasedContracts(positionsData || []);
-
-        // Refresh user balance
-        const { data: userData } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', userId)
-          .single();
-        setUser(userData);
-
-        setModalVisible(false);
-        setPrediction(null);
-        setBetAmount(1);
-      }
+      setModalVisible(false);
+      setPrediction(null);
+      setBetAmount(1);
+      setTonTxHash('');
     } catch (err) {
       setError(err.message || 'Failed to buy contracts');
       console.error(err);
@@ -385,6 +365,7 @@ const TradeInterfaceBlue = () => {
     if (!selectedPosition) return;
     
     try {
+      // Create sell order
       const { data, error } = await supabase
         .from('orders')
         .insert({
@@ -403,6 +384,7 @@ const TradeInterfaceBlue = () => {
       setSuccess('Sell order created successfully!');
       setError(null);
       
+      // Refresh positions
       const { data: positionsData } = await supabase
         .from('positions')
         .select('*')
@@ -443,6 +425,7 @@ const TradeInterfaceBlue = () => {
       }}
       bodyStyle={{ padding: 24 }}
     >
+      {/* Display portfolio value */}
       <div style={{ marginBottom: 16, padding: 12, background: '#f0f8ff', borderRadius: 8 }}>
         <Text strong>Портфель: </Text>
         <Text>{totalPortfolioValue.toFixed(2)} USDT</Text>
@@ -451,14 +434,17 @@ const TradeInterfaceBlue = () => {
         </Text>
       </div>
 
+      {/* Display success message */}
       {success && (
         <Alert message={success} type="success" style={{ marginBottom: 16 }} />
       )}
 
+      {/* Display error message */}
       {error && (
         <Alert message={error} type="error" style={{ marginBottom: 16 }} />
       )}
 
+      {/* Tab buttons */}
       <Space.Compact size="large" style={{ width: '100%', marginBottom: 24, background: '#f5f5f5', borderRadius: 6 }}>
         <TabButton
           $active={activeMenu === 'buy'}
@@ -482,6 +468,7 @@ const TradeInterfaceBlue = () => {
 
       <Divider style={{ margin: '16px 0' }} />
 
+      {/* Market info */}
       {market && (
         <div style={{ marginBottom: 16, padding: 12, background: '#f0f8ff', borderRadius: 8 }}>
           <Text strong>Контракт: </Text>
@@ -494,6 +481,7 @@ const TradeInterfaceBlue = () => {
 
       <Container>
         <SlideContainer $activeMenu={activeMenu}>
+          {/* Buy panel */}
           <MenuPanel>
             <Space direction="vertical" size="middle" style={{ width: '100%' }}>
               <Title level={5} style={{ color: '#1890ff', margin: 0 }}>
@@ -571,6 +559,7 @@ const TradeInterfaceBlue = () => {
             </Space>
           </MenuPanel>
 
+          {/* Sell panel */}
           <MenuPanel>
             <Space direction="vertical" size="middle" style={{ width: '100%' }}>
               <Title level={5} style={{ color: '#1890ff', margin: 0 }}>
@@ -673,6 +662,7 @@ const TradeInterfaceBlue = () => {
         </SlideContainer>
       </Container>
 
+      {/* Modal for buying */}
       <Modal
         title="Покупка контрактов"
         open={modalVisible}
@@ -686,7 +676,7 @@ const TradeInterfaceBlue = () => {
             type="primary" 
             style={{ background: '#1890ff', borderColor: '#1890ff' }}
             onClick={handleBuy}
-            disabled={!prediction || !user?.wallet}
+            disabled={!tonTxHash}
           >
             Купить {betAmount} контрактов
           </Button>,
@@ -714,6 +704,19 @@ const TradeInterfaceBlue = () => {
             <Text strong type="success">{(getCurrentPrice() * betAmount).toFixed(2)} USDT</Text>
           </div>
           
+          <Divider />
+          
+          <div>
+            <Text type="secondary" style={{ fontSize: '12px', display: 'block', marginBottom: 4 }}>
+              Хэш транзакции (обязательно)
+            </Text>
+            <Input 
+              placeholder="Введите хэш транзакции"
+              value={tonTxHash}
+              onChange={(e) => setTonTxHash(e.target.value)}
+            />
+          </div>
+
           <Divider />
           
           <div style={{ display: 'flex', justifyContent: 'space-between' }}>
