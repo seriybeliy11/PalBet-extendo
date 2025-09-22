@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Button, Card, Space, Typography, Input, Slider, Divider, Modal, Tag, Alert } from 'antd';
-import { ShoppingCartOutlined, DollarOutlined } from '@ant-design/icons';
+import { Button, Card, Space, Typography, Input, Slider, Divider, Modal, Tag, Alert, Spin } from 'antd';
+import { ShoppingCartOutlined, DollarOutlined, LoadingOutlined } from '@ant-design/icons';
 import styled from 'styled-components';
 import { createClient } from '@supabase/supabase-js';
+import 'buffer';
 import { TonConnectButton, useTonConnectUI } from '@tonconnect/ui-react';
 import { Address, beginCell, toNano, Cell } from '@ton/core';
 
@@ -105,7 +106,6 @@ const TradeInterfaceBlue = () => {
   const [prediction, setPrediction] = useState(null);
   const [betAmount, setBetAmount] = useState(1);
   const [modalVisible, setModalVisible] = useState(false);
-  const [offerPrice, setOfferPrice] = useState(0.5);
   const [depositAmount, setDepositAmount] = useState('');
   const [withdrawAmount, setWithdrawAmount] = useState('');
   const [sellAmount, setSellAmount] = useState(0);
@@ -121,33 +121,113 @@ const TradeInterfaceBlue = () => {
   const [totalPortfolioValue, setTotalPortfolioValue] = useState(0);
   const [orderBook, setOrderBook] = useState({ bids: [], asks: [] });
   const [tonWalletConnected, setTonWalletConnected] = useState(false);
+  const [transactionStatus, setTransactionStatus] = useState(null); // 'pending', 'confirmed', 'failed'
+  const [transactionHash, setTransactionHash] = useState(null);
 
   const userId = 1;
   const marketId = 1;
 
-  // Validate platform wallet
-  const validateTonAddress = (addressStr) => {
-    try {
-      Address.parse(addressStr);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const isPlatformWalletValid = validateTonAddress(PLATFORM_WALLET.toString());
-
+  // Подключение кошелька
   useEffect(() => {
     setTonWalletConnected(tonConnectUI.connected);
   }, [tonConnectUI.connected]);
 
+  // Fetch initial data
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const [userData, marketData, positionsData] = await Promise.all([
+          supabase.from('users').select('*').eq('id', userId).single(),
+          supabase.from('markets').select('*').eq('id', marketId).single(),
+          supabase.from('positions').select('*, markets!inner(name, yes_price, no_price, resolved)').eq('user_id', userId).eq('markets.resolved', false),
+        ]);
+        if (userData.error) throw userData.error;
+        if (marketData.error) throw marketData.error;
+        if (positionsData.error) throw positionsData.error;
+        setUser(userData.data);
+        setMarket(marketData.data);
+        setPurchasedContracts(positionsData.data || []);
+      } catch (err) {
+        setError('Failed to fetch data');
+      }
+    };
+    fetchData();
+  }, []);
+
+  // Fetch order book
+  useEffect(() => {
+    const fetchOrderBook = async () => {
+      if (!prediction) return;
+      try {
+        const { data, error } = await supabase
+          .from('orders')
+          .select('*')
+          .eq('market_id', marketId)
+          .eq('outcome', prediction)
+          .eq('status', 'active');
+        if (error) throw error;
+        setOrderBook({
+          bids: data?.filter(order => order.order_type === 'buy') || [],
+          asks: data?.filter(order => order.order_type === 'sell') || [],
+        });
+      } catch (err) {
+        setError('Failed to fetch order book');
+      }
+    };
+    fetchOrderBook();
+  }, [prediction]);
+
+  // Real-time subscriptions
+  useEffect(() => {
+    const subscriptions = [
+      supabase.channel('orders-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'orders', filter: `market_id=eq.${marketId}` }, async () => {
+        if (prediction) {
+          const { data } = await supabase.from('orders').select('*').eq('market_id', marketId).eq('outcome', prediction).eq('status', 'active');
+          if (data) setOrderBook({ bids: data.filter(o => o.order_type === 'buy'), asks: data.filter(o => o.order_type === 'sell') });
+          await updateMarketPrices(marketId);
+        }
+      }).subscribe(),
+      supabase.channel('markets-changes').on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'markets', filter: `id=eq.${marketId}` }, (payload) => setMarket(payload.new)).subscribe(),
+      supabase.channel('positions-changes').on('postgres_changes', { event: '*', schema: 'public', table: 'positions', filter: `user_id=eq.${userId}` }, async () => {
+        const { data, error } = await supabase.from('positions').select('*, markets!inner(name, yes_price, no_price, resolved)').eq('user_id', userId).eq('markets.resolved', false);
+        if (!error) setPurchasedContracts(data || []);
+      }).subscribe(),
+    ];
+    return () => subscriptions.forEach(sub => sub.unsubscribe());
+  }, [prediction]);
+
+  // Calculate potential profit
+  useEffect(() => {
+    if (prediction && betAmount > 0) {
+      const currentPrice = getCurrentPrice();
+      setPotentialProfit((1 - currentPrice) * betAmount);
+    } else {
+      setPotentialProfit(0);
+    }
+  }, [prediction, betAmount, market]);
+
+  // Calculate sell profit
+  useEffect(() => {
+    if (selectedPosition && minPrice > 0) {
+      setSellProfit({ usdt: minPrice * (sellAmount || selectedPosition.shares || 0) });
+    } else {
+      setSellProfit({ usdt: 0 });
+    }
+  }, [selectedPosition, minPrice, sellAmount]);
+
+  // Calculate portfolio value
+  useEffect(() => {
+    if (!purchasedContracts.length || !market) return;
+    const totalValue = purchasedContracts.reduce((sum, pos) => sum + (pos.shares || 0) * (pos.outcome === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5)), 0);
+    setTotalPortfolioValue(totalValue);
+  }, [purchasedContracts, market]);
+
   // Helper for Jetton nano
   const toJettonNano = (amount) => BigInt(Math.floor(amount * 10 ** USDT_DECIMALS));
 
-  // Get Jetton wallet address via runGetMethod
+  // Get Jetton wallet address
   const getJettonWalletAddress = async (masterAddress, ownerAddress) => {
     const inputCell = beginCell()
-      .storeUint(0, 32) // op get_wallet_address
       .storeAddress(ownerAddress)
       .endCell();
 
@@ -155,7 +235,7 @@ const TradeInterfaceBlue = () => {
       method: 'POST',
       headers: { 
         'Content-Type': 'application/json',
-        ...(TON_API_KEY && { 'X-API-Key': TON_API_KEY })
+        'X-API-Key': TON_API_KEY 
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
@@ -174,36 +254,156 @@ const TradeInterfaceBlue = () => {
     const data = await response.json();
     if (data.error) throw new Error(data.error.message);
 
-    if (data.result.exit_code !== 0) throw new Error(`Exit code: ${data.result.exit_code}`);
-
-    const boc = data.result.stack[0][1]; // base64 BOC of address
+    const boc = data.result.stack[0][1];
     const cell = Cell.fromBoc(Buffer.from(boc, 'base64'))[0];
     const slice = cell.beginParse();
     return slice.loadAddress();
   };
 
-  // Check deposit status via getTransactions polling
-  const checkDepositStatus = async (depositId, queryId, expectedAmount) => {
-    const platformJettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, PLATFORM_WALLET);
-    const platformJettonWalletStr = platformJettonWallet.toString();
-    const jettonAmount = toJettonNano(expectedAmount);
-    let attempts = 0;
-    const maxAttempts = 12; // ~1 min at 5s
+  // Проверка баланса кошелька (USDT Jetton)
+  const checkWalletBalance = async (userAddress) => {
+    try {
+      const jettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, userAddress);
 
-    const poll = async () => {
+      const response = await fetch(TON_API_URL, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-API-Key': TON_API_KEY 
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: Date.now(),
+          method: 'runGetMethod',
+          params: {
+            address: jettonWallet.toString(),
+            method: 'get_balance',
+            stack: []
+          }
+        })
+      });
+
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message);
+
+      const balanceNano = BigInt(data.result.stack[0][1]);
+      return Number(balanceNano) / (10 ** USDT_DECIMALS);
+    } catch (err) {
+      console.error('Balance check error:', err);
+      return 0;
+    }
+  };
+
+  // ==================== ДЕПОЗИТ ФЛОУ ====================
+  const handleDeposit = async () => {
+    const amount = parseFloat(depositAmount);
+    if (!amount || amount <= 0) {
+      setError('Please enter a valid deposit amount');
+      return;
+    }
+
+    if (!tonWalletConnected) {
+      setError('Please connect your TON wallet first');
+      return;
+    }
+
+    try {
+      setTransactionStatus('pending');
+      setError(null);
+      setSuccess(null);
+
+      // 1. Получаем адрес кошелька пользователя
+      const userAddress = Address.parse(tonConnectUI.account.address);
+      
+      // 2. Проверка баланса USDT
+      const walletBalance = await checkWalletBalance(userAddress);
+      if (walletBalance < amount) {
+        setError(`Insufficient wallet balance. Available: ${walletBalance.toFixed(2)} USDT`);
+        setTransactionStatus(null);
+        return;
+      }
+
+      // 3. Получаем Jetton адреса
+      const userJettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, userAddress);
+      const platformJettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, PLATFORM_WALLET);
+
+      // 4. Генерируем queryId
+      const queryId = BigInt(Math.floor(Math.random() * Number(2n ** 64n)));
+      const jettonAmount = toJettonNano(amount);
+
+      // 5. Создаем тело транзакции для Jetton transfer
+      const body = beginCell()
+        .storeUint(JETTON_TRANSFER_OP, 32)
+        .storeUint(queryId, 64)
+        .storeCoins(jettonAmount)
+        .storeAddress(platformJettonWallet)
+        .storeAddress(userAddress)
+        .storeMaybeRef(null)
+        .storeCoins(toNano('0.05'))
+        .storeMaybeRef(beginCell().storeStringTail(`Deposit for user ${userId}`).endCell())
+        .endCell();
+
+      // 6. Инициируем транзакцию
+      const transaction = {
+        validUntil: Math.floor(Date.now() / 1000) + 360,
+        messages: [
+          {
+            address: userJettonWallet.toString({ bounceable: true, urlSafe: true }),
+            amount: toNano('0.1').toString(),
+            payload: body.toBoc().toString('base64'),
+          }
+        ]
+      };
+
+      const result = await tonConnectUI.sendTransaction(transaction);
+      setTransactionHash(result.boc);
+
+      // 7. Создаем запись о депозите в БД
+      const { data: depositData, error: depositError } = await supabase
+        .from('deposits')
+        .insert({
+          user_id: userId,
+          query_id: queryId.toString(),
+          amount: amount,
+          status: 'pending',
+          user_wallet: userAddress.toString()
+        })
+        .select()
+        .single();
+
+      if (depositError) throw depositError;
+
+      setSuccess('Transaction sent. Waiting for confirmation...');
+
+      // 8. Отслеживаем статус транзакции
+      await trackTransactionStatus(depositData.id, queryId, jettonAmount, amount, platformJettonWallet);
+
+    } catch (err) {
+      setError('Failed to process deposit: ' + err.message);
+      setTransactionStatus('failed');
+      console.error('Deposit error:', err);
+    }
+  };
+
+  // Отслеживание статуса транзакции
+  const trackTransactionStatus = async (depositId, queryId, jettonAmount, amount, platformJettonWallet) => {
+    let attempts = 0;
+    const maxAttempts = 30; // 3 минуты максимум
+
+    const pollTransaction = async () => {
       try {
         const response = await fetch(TON_API_URL, {
           method: 'POST',
           headers: { 
             'Content-Type': 'application/json',
-            ...(TON_API_KEY && { 'X-API-Key': TON_API_KEY })
+            'X-API-Key': TON_API_KEY 
           },
           body: JSON.stringify({
             jsonrpc: '2.0',
             id: Date.now(),
             method: 'getTransactions',
             params: {
-              address: platformJettonWalletStr,
+              address: platformJettonWallet.toString(),
               limit: 10
             }
           })
@@ -227,60 +427,523 @@ const TradeInterfaceBlue = () => {
             const txAmount = slice.loadCoins();
 
             if (txQueryId === queryId && txAmount === jettonAmount) {
-              // Confirmed: Update DB and balance
-              const { error: updateError } = await supabase
-                .from('deposits')
-                .update({ 
-                  status: 'confirmed',
-                  tx_lt: BigInt(tx.transaction_id.lt),
-                  tx_hash: tx.transaction_id.hash 
-                })
-                .eq('id', depositId);
+              // Транзакция подтверждена
+              setTransactionStatus('confirmed');
+              setSuccess(`Deposit confirmed! +${amount} USDT added to your balance`);
 
-              if (updateError) {
-                console.error('Deposit update error:', updateError);
-                return;
-              }
-
-              const { data: userData, error: balError } = await supabase
+              // Обновляем баланс пользователя
+              const { data: userData, error } = await supabase
                 .from('users')
-                .update({ balance: (user?.balance || 0) + expectedAmount })
+                .update({ balance: (user?.balance || 0) + amount })
                 .eq('id', userId)
                 .select()
                 .single();
 
-              if (balError) {
-                console.error('Balance update error:', balError);
-              } else {
-                setUser(userData);
-                setSuccess(`Deposit confirmed: +${expectedAmount.toFixed(2)} USDT`);
-              }
-              return true; // Stop polling
+              if (error) throw error;
+              setUser(userData);
+
+              // Обновляем статус депозита
+              await supabase
+                .from('deposits')
+                .update({ 
+                  status: 'confirmed',
+                  tx_hash: tx.transaction_id.hash 
+                })
+                .eq('id', depositId);
+
+              setDepositAmount('');
+              return;
             }
           }
         }
-      } catch (err) {
-        console.error('Polling error:', err);
-      }
 
-      attempts++;
-      if (attempts < maxAttempts) {
-        setTimeout(poll, 5000);
-      } else {
-        const { error } = await supabase
-          .from('deposits')
-          .update({ status: 'failed' })
-          .eq('id', depositId);
-        if (!error) {
-          setError('Deposit timeout: Transaction not confirmed within 1 minute');
+        attempts++;
+        if (attempts < maxAttempts) {
+          setTimeout(pollTransaction, 6000); // Проверяем каждые 6 секунд
+        } else {
+          setTransactionStatus('failed');
+          setError('Transaction timeout: not confirmed within 3 minutes');
+          
+          await supabase
+            .from('deposits')
+            .update({ status: 'failed' })
+            .eq('id', depositId);
+        }
+      } catch (err) {
+        console.error('Transaction tracking error:', err);
+        attempts++;
+        if (attempts < maxAttempts) {
+          setTimeout(pollTransaction, 6000);
         }
       }
     };
 
-    poll();
+    pollTransaction();
   };
 
-  // Функции для расчета и обновления коэффициентов
+  // ==================== ВЫВОД ФЛОУ ====================
+  const handleWithdraw = async () => {
+    const amount = parseFloat(withdrawAmount);
+    if (!amount || amount <= 0) {
+      setError('Please enter a valid withdrawal amount');
+      return;
+    }
+    
+    if (amount > (user?.balance || 0)) {
+      setError('Insufficient balance');
+      return;
+    }
+
+    if (!tonWalletConnected) {
+      setError('Please connect your TON wallet first');
+      return;
+    }
+
+    try {
+      setTransactionStatus('pending');
+      setError(null);
+      setSuccess(null);
+
+      // 1. Создаем запись о выводе
+      const { data: withdrawData, error: withdrawError } = await supabase
+        .from('withdrawals')
+        .insert({
+          user_id: userId,
+          amount: amount,
+          status: 'pending',
+          user_wallet: tonConnectUI.account.address
+        })
+        .select()
+        .single();
+
+      if (withdrawError) throw withdrawError;
+
+      // 2. Вызываем API для инициации вывода (бэкенд с seed-фразой)
+      const response = await fetch('/api/withdraw', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + process.env.REACT_APP_WITHDRAW_KEY
+        },
+        body: JSON.stringify({
+          amount: amount,
+          to_address: tonConnectUI.account.address,
+          withdraw_id: withdrawData.id
+        })
+      });
+
+      if (!response.ok) throw new Error('Withdrawal API error');
+
+      const result = await response.json();
+      setTransactionHash(result.tx_hash);
+      setSuccess('Withdrawal transaction sent. Waiting for confirmation...');
+
+      // 3. Отслеживаем статус (полинг на кошельке пользователя для Jetton)
+      const userAddress = Address.parse(tonConnectUI.account.address);
+      const userJettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, userAddress);
+      await trackWithdrawalStatus(withdrawData.id, result.tx_hash, amount, userJettonWallet);
+
+    } catch (err) {
+      setError('Failed to process withdrawal: ' + err.message);
+      setTransactionStatus('failed');
+      console.error('Withdrawal error:', err);
+    }
+  };
+
+  // Отслеживание статуса вывода
+  const trackWithdrawalStatus = async (withdrawId, txHash, amount, userJettonWallet) => {
+    let attempts = 0;
+    const maxAttempts = 30;
+    const jettonAmount = toJettonNano(amount);
+
+    const pollWithdrawal = async () => {
+      try {
+        const response = await fetch(TON_API_URL, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'X-API-Key': TON_API_KEY 
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'getTransactions',
+            params: {
+              address: userJettonWallet.toString(),
+              limit: 10
+            }
+          })
+        });
+
+        const data = await response.json();
+        if (data.error) throw new Error(data.error.message);
+
+        const transactions = data.result || [];
+        for (const tx of transactions) {
+          const inMsg = tx.in_msg;
+          if (!inMsg?.body) continue;
+
+          const bodyBoc = inMsg.body;
+          const bodyCell = Cell.fromBoc(Buffer.from(bodyBoc, 'base64'))[0];
+          const slice = bodyCell.beginParse();
+          const op = slice.loadUint(32);
+
+          if (op === BigInt(JETTON_TRANSFER_NOTIFICATION_OP)) {
+            const txAmount = slice.loadCoins();
+            if (txAmount === jettonAmount && tx.transaction_id.hash === txHash) {
+              setTransactionStatus('confirmed');
+              setSuccess(`Withdrawal confirmed! ${amount} USDT sent to your wallet`);
+
+              // Обновляем баланс пользователя
+              const { data: userData, error } = await supabase
+                .from('users')
+                .update({ balance: (user?.balance || 0) - amount })
+                .eq('id', userId)
+                .select()
+                .single();
+
+              if (error) throw error;
+              setUser(userData);
+
+              await supabase
+                .from('withdrawals')
+                .update({ status: 'confirmed' })
+                .eq('id', withdrawId);
+
+              setWithdrawAmount('');
+              return;
+            }
+          }
+        }
+
+        attempts++;
+        if (attempts < maxAttempts) {
+          setTimeout(pollWithdrawal, 6000);
+        } else {
+          setTransactionStatus('failed');
+          setError('Withdrawal timeout: not confirmed within 3 minutes');
+          
+          await supabase
+            .from('withdrawals')
+            .update({ status: 'failed' })
+            .eq('id', withdrawId);
+        }
+      } catch (err) {
+        console.error('Withdrawal tracking error:', err);
+        attempts++;
+        if (attempts < maxAttempts) {
+          setTimeout(pollWithdrawal, 6000);
+        }
+      }
+    };
+
+    pollWithdrawal();
+  };
+
+  // ==================== ПОКУПКА ФЛОУ ====================
+  const handleBuy = async () => {
+    const currentPrice = getCurrentPrice();
+    const totalCost = currentPrice * betAmount;
+    
+    if (!user || user.balance < totalCost) {
+      setError('Insufficient balance');
+      return;
+    }
+
+    try {
+      // 1. Блокируем средства
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .update({ 
+          balance: (user.balance - totalCost),
+          locked_balance: (user.locked_balance || 0) + totalCost
+        })
+        .eq('id', userId)
+        .select()
+        .single();
+
+      if (userError) throw userError;
+
+      // 2. Создаем ордер на покупку
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .insert({
+          user_id: userId,
+          market_id: marketId,
+          outcome: prediction,
+          order_type: 'buy',
+          price: currentPrice,
+          amount: totalCost,
+          shares: betAmount,
+          status: 'active'
+        })
+        .select()
+        .single();
+
+      if (orderError) throw orderError;
+
+      setSuccess('Buy order created successfully! Order is now in the order book');
+      setError(null);
+      setUser(userData);
+      setModalVisible(false);
+      setPrediction(null);
+      setBetAmount(1);
+
+      // 3. Запускаем matching engine (в реальности это будет отдельный процесс)
+      setTimeout(() => executeOrder(orderData.id), 1000);
+
+    } catch (err) {
+      setError(err.message || 'Failed to create buy order');
+      console.error(err);
+    }
+  };
+
+  // ==================== ПРОДАЖА ФЛОУ ====================
+  const handleSellRequest = async () => {
+    if (!selectedPosition) return;
+    
+    const sellShares = sellAmount || selectedPosition.shares;
+    const totalValue = minPrice * sellShares;
+
+    if (sellShares > selectedPosition.shares - (selectedPosition.locked_shares || 0)) {
+      setError('Not enough shares to sell');
+      return;
+    }
+
+    try {
+      // 1. Блокируем акции
+      const { error: lockError } = await supabase
+        .from('positions')
+        .update({
+          locked_shares: (selectedPosition.locked_shares || 0) + sellShares
+        })
+        .eq('id', selectedPosition.id);
+
+      if (lockError) throw lockError;
+
+      // 2. Создаем ордер на продажу
+      const { data: orderData, error: orderError } = await supabase
+        .from('orders')
+        .insert({
+          user_id: userId,
+          market_id: marketId,
+          outcome: selectedPosition.outcome,
+          order_type: 'sell',
+          price: minPrice,
+          amount: totalValue,
+          shares: sellShares,
+          status: 'active'
+        })
+        .select()
+        .single();
+
+      if (orderError) throw orderError;
+
+      setSuccess('Sell order created successfully! Order is now in the order book');
+      setError(null);
+      
+      // Обновляем позиции
+      const { data: positionsData } = await supabase
+        .from('positions')
+        .select('*, markets!inner(name, yes_price, no_price, resolved)')
+        .eq('user_id', userId)
+        .eq('markets.resolved', false);
+      setPurchasedContracts(positionsData || []);
+      
+      setSelectedPosition(null);
+      setSellAmount(0);
+      setMinPrice(0);
+
+      // 3. Запускаем matching engine
+      setTimeout(() => executeOrder(orderData.id), 1000);
+
+    } catch (err) {
+      setError(err.message || 'Failed to create sell order');
+      console.error(err);
+    }
+  };
+
+  // ==================== MATCHING ENGINE ====================
+  const executeOrder = async (newOrderId) => {
+    try {
+      const { data: newOrder, error: orderError } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('id', newOrderId)
+        .single();
+
+      if (orderError) throw orderError;
+
+      const oppositeType = newOrder.order_type === 'buy' ? 'sell' : 'buy';
+      
+      // Ищем matching ордера
+      const { data: matchingOrders, error: matchError } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('market_id', marketId)
+        .eq('outcome', newOrder.outcome)
+        .eq('order_type', oppositeType)
+        .eq('status', 'active')
+        .order('price', { ascending: newOrder.order_type === 'buy' })
+        .limit(10);
+
+      if (matchError) throw matchError;
+
+      let remainingShares = newOrder.shares - (newOrder.filled_shares || 0);
+      
+      for (const matchingOrder of matchingOrders) {
+        if (remainingShares <= 0) break;
+
+        // Проверяем price matching
+        if ((newOrder.order_type === 'buy' && newOrder.price >= matchingOrder.price) ||
+            (newOrder.order_type === 'sell' && newOrder.price <= matchingOrder.price)) {
+          
+          const executableShares = Math.min(
+            remainingShares,
+            matchingOrder.shares - (matchingOrder.filled_shares || 0)
+          );
+
+          if (executableShares > 0) {
+            const executionPrice = matchingOrder.price;
+            const totalAmount = executionPrice * executableShares;
+            const fee = totalAmount * 0.02;
+
+            // Создаем сделку
+            const { error: tradeError } = await supabase
+              .from('trades')
+              .insert({
+                buy_order_id: newOrder.order_type === 'buy' ? newOrder.id : matchingOrder.id,
+                sell_order_id: newOrder.order_type === 'sell' ? newOrder.id : matchingOrder.id,
+                market_id: marketId,
+                outcome: newOrder.outcome,
+                price: executionPrice,
+                shares: executableShares,
+                fee: fee
+              });
+
+            if (tradeError) throw tradeError;
+
+            // Обновляем ордера
+            await updateOrderAfterExecution(newOrder.id, executableShares);
+            await updateOrderAfterExecution(matchingOrder.id, executableShares);
+
+            // Обновляем позиции и балансы
+            await updateUserPositionsAfterTrade(newOrder, matchingOrder, executableShares, executionPrice, fee);
+
+            remainingShares -= executableShares;
+          }
+        }
+      }
+
+      // Обновляем цены рынка
+      await updateMarketPrices(marketId);
+
+    } catch (err) {
+      console.error('Error executing order:', err);
+    }
+  };
+
+  const updateOrderAfterExecution = async (orderId, executedShares) => {
+    const { data: order } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', orderId)
+      .single();
+
+    const newFilledShares = (order.filled_shares || 0) + executedShares;
+    const status = newFilledShares >= order.shares ? 'filled' : 
+                  newFilledShares > 0 ? 'partially_filled' : 'active';
+
+    await supabase
+      .from('orders')
+      .update({
+        filled_shares: newFilledShares,
+        status: status
+      })
+      .eq('id', orderId);
+  };
+
+  const updateUserPositionsAfterTrade = async (newOrder, matchingOrder, shares, price, fee) => {
+    let buyerId, sellerId, buyerOutcome, sellerOutcome, buyerAmount, sellerAmount;
+
+    if (newOrder.order_type === 'buy') {
+      buyerId = newOrder.user_id;
+      sellerId = matchingOrder.user_id;
+      buyerOutcome = newOrder.outcome;
+      sellerOutcome = matchingOrder.outcome;
+      buyerAmount = price * shares;
+      sellerAmount = buyerAmount - fee;
+    } else {
+      buyerId = matchingOrder.user_id;
+      sellerId = newOrder.user_id;
+      buyerOutcome = matchingOrder.outcome;
+      sellerOutcome = newOrder.outcome;
+      buyerAmount = price * shares;
+      sellerAmount = buyerAmount - fee;
+    }
+
+    // Update buyer position and unlock funds
+    const { data: buyerPosition } = await supabase
+      .from('positions')
+      .select('*')
+      .eq('user_id', buyerId)
+      .eq('market_id', marketId)
+      .eq('outcome', buyerOutcome)
+      .single();
+
+    const buyerNewShares = (buyerPosition?.shares || 0) + shares;
+    const buyerNewLocked = Math.max(0, (buyerPosition?.locked_shares || 0) - shares);
+
+    await supabase
+      .from('positions')
+      .upsert({
+        user_id: buyerId,
+        market_id: marketId,
+        outcome: buyerOutcome,
+        shares: buyerNewShares,
+        locked_shares: buyerNewLocked
+      });
+
+    await supabase
+      .from('users')
+      .update({ locked_balance: (user?.locked_balance || 0) - buyerAmount })
+      .eq('id', buyerId);
+
+    // Update seller position and add funds
+    const { data: sellerPosition } = await supabase
+      .from('positions')
+      .select('*')
+      .eq('user_id', sellerId)
+      .eq('market_id', marketId)
+      .eq('outcome', sellerOutcome)
+      .single();
+
+    const sellerNewShares = (sellerPosition?.shares || 0) - shares;
+    const sellerNewLocked = Math.max(0, (sellerPosition?.locked_shares || 0) - shares);
+
+    if (sellerNewShares <= 0) {
+      await supabase
+        .from('positions')
+        .delete()
+        .eq('id', sellerPosition.id);
+    } else {
+      await supabase
+        .from('positions')
+        .update({
+          shares: sellerNewShares,
+          locked_shares: sellerNewLocked
+        })
+        .eq('id', sellerPosition.id);
+    }
+
+    await supabase
+      .from('users')
+      .update({ balance: (user?.balance || 0) + sellerAmount })
+      .eq('id', sellerId);
+  };
+
+  // ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
+  
   const calculateMarketPrices = (bids, asks) => {
     if (bids.length === 0 && asks.length === 0) {
       return { yesPrice: 0.5, noPrice: 0.5 };
@@ -329,660 +992,26 @@ const TradeInterfaceBlue = () => {
 
       if (updateError) throw updateError;
 
-      return { yesPrice, noPrice };
+      setMarket({ ...market, yes_price: yesPrice, no_price: noPrice });
     } catch (err) {
       console.error('Error updating market prices:', err);
-      return { yesPrice: 0.5, noPrice: 0.5 };
     }
   };
 
-  const unlockUserFunds = async (userId, amount) => {
-    try {
-      const { data: userData } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', userId)
-        .single();
-
-      if (userData) {
-        await supabase
-          .from('users')
-          .update({ 
-            locked_balance: Math.max(0, (userData.locked_balance || 0) - amount)
-          })
-          .eq('id', userId);
-      }
-    } catch (err) {
-      console.error('Error unlocking funds:', err);
-    }
-  };
-
-  const updateOrderFill = async (orderId, shares) => {
-    try {
-      const { data: order } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('id', orderId)
-        .single();
-
-      if (!order) return;
-
-      const newFilledShares = (order.filled_shares || 0) + shares;
-      const status = newFilledShares >= order.shares ? 'filled' : 
-                    newFilledShares > 0 ? 'partially_filled' : 'active';
-
-      await supabase
-        .from('orders')
-        .update({
-          filled_shares: newFilledShares,
-          status: status,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', orderId);
-    } catch (err) {
-      console.error('Error updating order fill:', err);
-    }
-  };
-
-  const updateUserPosition = async (userId, marketId, outcome, shares, amount, type) => {
-    try {
-      const { data: existingPosition } = await supabase
-        .from('positions')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('market_id', marketId)
-        .eq('outcome', outcome)
-        .single();
-
-      const newShares = (existingPosition?.shares || 0) + shares;
-      const newLockedShares = Math.max(0, (existingPosition?.locked_shares || 0) - Math.abs(shares));
-      
-      if (newShares === 0 && existingPosition) {
-        await supabase
-          .from('positions')
-          .delete()
-          .eq('id', existingPosition.id);
-      } else {
-        await supabase
-          .from('positions')
-          .upsert({
-            user_id: userId,
-            market_id: marketId,
-            outcome: outcome,
-            shares: newShares,
-            locked_shares: newLockedShares,
-            ...(existingPosition ? {} : { id: undefined })
-          }, {
-            onConflict: ['user_id', 'market_id', 'outcome']
-          });
-      }
-
-      const { data: userData } = await supabase
-        .from('users')
-        .select('*')
-        .eq('id', userId)
-        .single();
-
-      if (userData) {
-        if (type === 'buy') {
-          await supabase
-            .from('users')
-            .update({ balance: userData.balance - amount })
-            .eq('id', userId);
-        } else {
-          await supabase
-            .from('users')
-            .update({ balance: userData.balance + amount })
-            .eq('id', userId);
-        }
-      }
-    } catch (err) {
-      console.error('Error updating user position:', err);
-    }
-  };
-
-  const executeOrder = async (newOrderId) => {
-    try {
-      const { data: newOrder, error: orderError } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('id', newOrderId)
-        .single();
-
-      if (orderError) throw orderError;
-
-      const oppositeType = newOrder.order_type === 'buy' ? 'sell' : 'buy';
-      
-      const { data: matchingOrders, error: matchError } = await supabase
-        .from('orders')
-        .select('*')
-        .eq('market_id', marketId)
-        .eq('outcome', newOrder.outcome)
-        .eq('order_type', oppositeType)
-        .eq('status', 'active')
-        .order('price', { ascending: newOrder.order_type === 'buy' })
-        .limit(10);
-
-      if (matchError) throw matchError;
-
-      let remainingShares = newOrder.shares - (newOrder.filled_shares || 0);
-      
-      for (const matchingOrder of matchingOrders) {
-        if (remainingShares <= 0) break;
-
-        if ((newOrder.order_type === 'buy' && newOrder.price >= matchingOrder.price) ||
-            (newOrder.order_type === 'sell' && newOrder.price <= matchingOrder.price)) {
-          
-          const executableShares = Math.min(
-            remainingShares,
-            matchingOrder.shares - (matchingOrder.filled_shares || 0)
-          );
-
-          if (executableShares > 0) {
-            const executionPrice = matchingOrder.price;
-            const totalAmount = executionPrice * executableShares;
-            const fee = totalAmount * 0.02;
-
-            const { error: tradeError } = await supabase
-              .from('trades')
-              .insert({
-                buy_order_id: newOrder.order_type === 'buy' ? newOrder.id : matchingOrder.id,
-                sell_order_id: newOrder.order_type === 'sell' ? newOrder.id : matchingOrder.id,
-                market_id: marketId,
-                outcome: newOrder.outcome,
-                price: executionPrice,
-                shares: executableShares,
-                fee: fee
-              });
-
-            if (tradeError) throw tradeError;
-
-            await updateOrderFill(newOrder.id, executableShares);
-            await updateOrderFill(matchingOrder.id, executableShares);
-
-            await updateUserPosition(
-              newOrder.user_id, 
-              marketId, 
-              newOrder.outcome, 
-              executableShares, 
-              totalAmount, 
-              'buy'
-            );
-
-            await updateUserPosition(
-              matchingOrder.user_id, 
-              marketId, 
-              matchingOrder.outcome, 
-              -executableShares, 
-              totalAmount - fee, 
-              'sell'
-            );
-
-            await unlockUserFunds(newOrder.user_id, totalAmount);
-            await unlockUserFunds(matchingOrder.user_id, totalAmount);
-
-            remainingShares -= executableShares;
-          }
-        }
-      }
-
-      if (remainingShares === 0) {
-        await supabase
-          .from('orders')
-          .update({ status: 'filled' })
-          .eq('id', newOrder.id);
-      } else if (remainingShares < newOrder.shares) {
-        await supabase
-          .from('orders')
-          .update({ status: 'partially_filled' })
-          .eq('id', newOrder.id);
-      }
-
-    } catch (err) {
-      console.error('Error executing order:', err);
-    }
-  };
-
-  // Calculate total portfolio value
-  useEffect(() => {
-    const calculatePortfolioValue = async () => {
-      if (!purchasedContracts.length || !market) return;
-      
-      let totalValue = 0;
-      for (const pos of purchasedContracts) {
-        const price = pos.outcome === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
-        totalValue += (pos.shares || 0) * price;
-      }
-      setTotalPortfolioValue(totalValue);
-    };
-    calculatePortfolioValue();
-  }, [purchasedContracts, market]);
-
-  // Fetch user data
-  useEffect(() => {
-    const fetchUser = async () => {
-      try {
-        const { data, error } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', userId)
-          .single();
-        
-        if (error) throw error;
-        setUser(data);
-      } catch (err) {
-        setError('Failed to fetch user data');
-        console.error(err);
-      }
-    };
-    fetchUser();
-  }, [userId]);
-
-  // Fetch market data
-  useEffect(() => {
-    const fetchMarket = async () => {
-      try {
-        const { data, error } = await supabase
-          .from('markets')
-          .select('*')
-          .eq('id', marketId)
-          .single();
-        
-        if (error) throw error;
-        setMarket(data);
-        if (data) {
-          setOfferPrice(data.yes_price || 0.5);
-        }
-      } catch (err) {
-        setError('Failed to fetch market data');
-        console.error(err);
-      }
-    };
-    fetchMarket();
-  }, [marketId]);
-
-  // Fetch user positions
-  useEffect(() => {
-    const fetchPositions = async () => {
-      try {
-        const { data, error } = await supabase
-          .from('positions')
-          .select('*')
-          .eq('user_id', userId);
-        
-        if (error) throw error;
-        setPurchasedContracts(data || []);
-      } catch (err) {
-        setError('Failed to fetch positions');
-        console.error(err);
-      }
-    };
-    fetchPositions();
-  }, [userId]);
-
-  // Fetch order book
-  useEffect(() => {
-    const fetchOrderBook = async () => {
-      if (!prediction) return;
-      
-      try {
-        const { data, error } = await supabase
-          .from('orders')
-          .select('*')
-          .eq('market_id', marketId)
-          .eq('outcome', prediction)
-          .eq('status', 'active');
-
-        if (error) throw error;
-
-        const bids = data?.filter(order => order.order_type === 'buy') || [];
-        const asks = data?.filter(order => order.order_type === 'sell') || [];
-        
-        setOrderBook({ bids, asks });
-      } catch (err) {
-        console.error('Failed to fetch order book:', err);
-        setOrderBook({ bids: [], asks: [] });
-      }
-    };
-    fetchOrderBook();
-  }, [prediction, marketId]);
-
-  // Real-time subscriptions
-  useEffect(() => {
-    const ordersSubscription = supabase
-      .channel('orders-changes')
-      .on('postgres_changes', 
-        { 
-          event: '*', 
-          schema: 'public', 
-          table: 'orders',
-          filter: `market_id=eq.${marketId}`
-        }, 
-        async () => {
-          if (prediction) {
-            const { data } = await supabase
-              .from('orders')
-              .select('*')
-              .eq('market_id', marketId)
-              .eq('outcome', prediction)
-              .eq('status', 'active');
-            
-            if (data) {
-              const bids = data.filter(order => order.order_type === 'buy');
-              const asks = data.filter(order => order.order_type === 'sell');
-              setOrderBook({ bids, asks });
-            }
-          }
-          await updateMarketPrices(marketId);
-        }
-      )
-      .subscribe();
-
-    const marketsSubscription = supabase
-      .channel('markets-changes')
-      .on('postgres_changes', 
-        { 
-          event: 'UPDATE', 
-          schema: 'public', 
-          table: 'markets',
-          filter: `id=eq.${marketId}`
-        }, 
-        (payload) => {
-          setMarket(payload.new);
-        }
-      )
-      .subscribe();
-
-    const positionsSubscription = supabase
-      .channel('positions-changes')
-      .on('postgres_changes', 
-        { 
-          event: '*', 
-          schema: 'public', 
-          table: 'positions',
-          filter: `user_id=eq.${userId}`
-        }, 
-        async () => {
-          const { data } = await supabase
-            .from('positions')
-            .select('*')
-            .eq('user_id', userId);
-          setPurchasedContracts(data || []);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      ordersSubscription.unsubscribe();
-      marketsSubscription.unsubscribe();
-      positionsSubscription.unsubscribe();
-    };
-  }, [marketId, userId, prediction]);
-
-  // Calculate potential profit for buying
-  useEffect(() => {
-    if (prediction && betAmount > 0) {
-      const currentPrice = getCurrentPrice();
-      const profit = (1 - currentPrice) * betAmount;
-      setPotentialProfit(profit);
-    } else {
-      setPotentialProfit(0);
-    }
-  }, [prediction, betAmount, orderBook, market]);
-
-  // Calculate sell value
-  useEffect(() => {
-    if (selectedPosition && minPrice > 0) {
-      const sellValue = minPrice * (sellAmount || selectedPosition.shares || 0);
-      setSellProfit({ usdt: sellValue });
-    } else {
-      setSellProfit({ usdt: 0 });
-    }
-  }, [selectedPosition, minPrice, sellAmount]);
-
-  // Get current price based on market data
   const getCurrentPrice = () => {
     if (!prediction || !market) return 0.5;
     return prediction === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
   };
 
-  const handleDeposit = async () => {
-    if (!isPlatformWalletValid) {
-      setError('Invalid platform wallet address');
-      return;
-    }
-
-    if (!tonWalletConnected) {
-      setError('Please connect your TON wallet first');
-      return;
-    }
-
-    const amount = parseFloat(depositAmount);
-    if (!amount || amount <= 0) {
-      setError('Please enter a valid deposit amount');
-      return;
-    }
-
-    try {
-      const userAddr = Address.parse(tonConnectUI.account.address);
-      const userJettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, userAddr);
-      const platformJettonWallet = await getJettonWalletAddress(USDT_MASTER_ADDRESS, PLATFORM_WALLET);
-
-      // Generate unique queryId
-      const queryId = BigInt(Math.floor(Math.random() * Number(2n ** 64n)));
-      const jettonAmount = toJettonNano(amount);
-
-      const body = beginCell()
-        .storeUint(JETTON_TRANSFER_OP, 32)
-        .storeUint(queryId, 64)
-        .storeCoins(jettonAmount)
-        .storeAddress(platformJettonWallet)
-        .storeAddress(userAddr)
-        .storeMaybeRef(null)
-        .storeCoins(toNano('0.05'))
-        .storeMaybeRef(beginCell().storeStringTail('Deposit to platform').endCell())
-        .endCell();
-
-      const messages = [
-        {
-          address: userJettonWallet.toString({ bounceable: true, urlSafe: true }),
-          amount: toNano('0.1').toString(),
-          payload: body.toBoc().toString('base64'),
-        },
-      ];
-
-      const txResult = await tonConnectUI.sendTransaction({
-        validUntil: Math.floor(Date.now() / 1000) + 360,
-        messages,
-      });
-
-      // Record pending in deposits
-      const { data: depositData, error: depositError } = await supabase
-        .from('deposits')
-        .insert({
-          user_id: userId,
-          query_id: queryId.toString(),
-          amount,
-          status: 'pending'
-        })
-        .select()
-        .single();
-
-      if (depositError) throw depositError;
-
-      setSuccess(`Deposit initiated. Query ID: ${queryId.toString()}. Awaiting confirmation...`);
-      setError(null);
-      setDepositAmount('');
-
-      // Start polling for confirmation
-      checkDepositStatus(depositData.id, queryId, amount);
-
-    } catch (err) {
-      setError('Failed to process TON deposit: ' + err.message);
-      console.error(err);
-    }
-  };
-
-  const handleWithdraw = async () => {
-    const amount = parseFloat(withdrawAmount);
-    if (!amount || amount <= 0) {
-      setError('Please enter a valid withdrawal amount');
-      return;
-    }
-    if (amount > (user?.balance || 0)) {
-      setError('Insufficient balance');
-      return;
-    }
-
-    try {
-      const { data: userData, error } = await supabase
-        .from('users')
-        .update({ balance: (user?.balance || 0) - amount })
-        .eq('id', userId)
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      setUser(userData);
-      setSuccess(`Successfully withdrew ${amount} USDT`);
-      setError(null);
-      setWithdrawAmount('');
-    } catch (err) {
-      setError('Failed to process withdrawal');
-      console.error(err);
-    }
-  };
-
-  const handleBuy = async () => {
-    const currentPrice = getCurrentPrice();
-    const totalCost = currentPrice * betAmount;
-    
-    if (!user || user.balance < totalCost) {
-      setError('Insufficient balance');
-      return;
-    }
-
-    try {
-      // Block funds
-      const { data: userData, error: userError } = await supabase
-        .from('users')
-        .update({ 
-          balance: (user.balance - totalCost),
-          locked_balance: (user.locked_balance || 0) + totalCost
-        })
-        .eq('id', userId)
-        .select()
-        .single();
-
-      if (userError) throw userError;
-
-      // Create order
-      const { data: orderData, error: orderError } = await supabase
-        .from('orders')
-        .insert({
-          user_id: userId,
-          market_id: marketId,
-          outcome: prediction,
-          order_type: 'buy',
-          price: currentPrice,
-          amount: totalCost,
-          shares: betAmount,
-          status: 'active'
-        })
-        .select()
-        .single();
-
-      if (orderError) throw orderError;
-
-      // Execute order against matching orders
-      await executeOrder(orderData.id);
-
-      // Update market prices
-      await updateMarketPrices(marketId);
-
-      setSuccess('Buy order placed successfully!');
-      setError(null);
-      setUser(userData);
-      setModalVisible(false);
-      setPrediction(null);
-      setBetAmount(1);
-    } catch (err) {
-      setError(err.message || 'Failed to buy contracts');
-      console.error(err);
-    }
-  };
-
-  const handleSellRequest = async () => {
-    if (!selectedPosition) return;
-    
-    const sellShares = sellAmount || selectedPosition.shares;
-    const currentPrice = getCurrentPrice();
-    const totalValue = currentPrice * sellShares;
-
-    if (sellShares > selectedPosition.shares) {
-      setError('Not enough shares to sell');
-      return;
-    }
-
-    try {
-      // Block shares
-      const { error: lockError } = await supabase
-        .from('positions')
-        .update({
-          locked_shares: (selectedPosition.locked_shares || 0) + sellShares
-        })
-        .eq('id', selectedPosition.id);
-
-      if (lockError) throw lockError;
-
-      // Create sell order
-      const { data: orderData, error: orderError } = await supabase
-        .from('orders')
-        .insert({
-          user_id: userId,
-          market_id: marketId,
-          outcome: selectedPosition.outcome,
-          order_type: 'sell',
-          price: minPrice,
-          amount: totalValue,
-          shares: sellShares,
-          status: 'active'
-        })
-        .select()
-        .single();
-
-      if (orderError) throw orderError;
-
-      // Execute order
-      await executeOrder(orderData.id);
-
-      // Update market prices
-      await updateMarketPrices(marketId);
-
-      setSuccess('Sell order created successfully!');
-      setError(null);
-      
-      // Refresh positions
-      const { data: positionsData } = await supabase
-        .from('positions')
-        .select('*')
-        .eq('user_id', userId);
-      setPurchasedContracts(positionsData || []);
-      
-      setSelectedPosition(null);
-      setSellAmount(0);
-      setMinPrice(0);
-    } catch (err) {
-      setError(err.message || 'Failed to create sell order');
-      console.error(err);
-    }
-  };
-
   const handlePositionSelect = (position) => {
     setSelectedPosition(position);
-    setSellAmount(position.shares || 0);
-    setMinPrice(getCurrentPrice());
+    setSellAmount(position.shares - (position.locked_shares || 0));
+    setMinPrice(getCurrentPrice(position.outcome));
+  };
+
+  const getCurrentPrice = (outcome) => {
+    if (!market) return 0.5;
+    return outcome === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
   };
 
   if (market && market.resolved) {
@@ -992,6 +1021,10 @@ const TradeInterfaceBlue = () => {
       </Card>
     );
   }
+
+  const sellableContracts = purchasedContracts.filter(
+    contract => (contract.shares - (contract.locked_shares || 0)) > 0
+  );
 
   return (
     <Card
@@ -1004,7 +1037,46 @@ const TradeInterfaceBlue = () => {
       }}
       bodyStyle={{ padding: 24 }}
     >
-      {/* Display portfolio value */}
+      {/* Transaction Status Modal */}
+      <Modal
+        title="Transaction Status"
+        open={transactionStatus !== null}
+        footer={null}
+        closable={transactionStatus === 'confirmed' || transactionStatus === 'failed'}
+        onCancel={() => setTransactionStatus(null)}
+      >
+        <div style={{ textAlign: 'center', padding: '20px' }}>
+          {transactionStatus === 'pending' && (
+            <>
+              <Spin indicator={<LoadingOutlined style={{ fontSize: 48 }} spin />} />
+              <Text style={{ display: 'block', marginTop: 16 }}>
+                Waiting for transaction confirmation...
+              </Text>
+              {transactionHash && (
+                <Text type="secondary" style={{ fontSize: '12px' }}>
+                  Hash: {transactionHash.slice(0, 10)}...{transactionHash.slice(-8)}
+                </Text>
+              )}
+            </>
+          )}
+          {transactionStatus === 'confirmed' && (
+            <>
+              <Text type="success" strong style={{ fontSize: '16px' }}>
+                ✅ Transaction Confirmed!
+              </Text>
+            </>
+          )}
+          {transactionStatus === 'failed' && (
+            <>
+              <Text type="danger" strong style={{ fontSize: '16px' }}>
+                ❌ Transaction Failed
+              </Text>
+            </>
+          )}
+        </div>
+      </Modal>
+
+      {/* Portfolio Summary */}
       <div style={{ marginBottom: 16, padding: 12, background: '#f0f8ff', borderRadius: 8 }}>
         <Text strong>Портфель: </Text>
         <Text>{totalPortfolioValue.toFixed(2)} USDT</Text>
@@ -1034,7 +1106,7 @@ const TradeInterfaceBlue = () => {
             type="number"
             suffix="USDT"
           />
-          <Button type="primary" onClick={handleDeposit} disabled={!tonWalletConnected || !isPlatformWalletValid}>
+          <Button type="primary" onClick={handleDeposit} disabled={!tonWalletConnected}>
             Deposit via TON
           </Button>
         </Space.Compact>
@@ -1046,11 +1118,8 @@ const TradeInterfaceBlue = () => {
             type="number"
             suffix="USDT"
           />
-          <Button type="primary" onClick={handleWithdraw}>Withdraw</Button>
+          <Button type="primary" onClick={handleWithdraw} disabled={!tonWalletConnected}>Withdraw</Button>
         </Space.Compact>
-        {!isPlatformWalletValid && (
-          <Alert message="Platform wallet validation failed" type="error" />
-        )}
       </Space>
 
       {/* Display success message */}
@@ -1094,10 +1163,10 @@ const TradeInterfaceBlue = () => {
           <Text>{market.name}</Text>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
             <Text type="secondary" style={{ fontSize: '12px' }}>
-              ДА: {(market.yes_price * 100).toFixed(1)}%
+              ДА: {((market.yes_price || 0.5) * 100).toFixed(1)}%
             </Text>
             <Text type="secondary" style={{ fontSize: '12px' }}>
-              НЕТ: {(market.no_price * 100).toFixed(1)}%
+              НЕТ: {((market.no_price || 0.5) * 100).toFixed(1)}%
             </Text>
           </div>
         </div>
@@ -1126,7 +1195,7 @@ const TradeInterfaceBlue = () => {
                     }}
                     onClick={() => setPrediction('yes')}
                   >
-                    ДА ({(market?.yes_price * 100)?.toFixed(1)}%)
+                    ДА ({((market?.yes_price || 0.5) * 100).toFixed(1)}%)
                   </Button>
                   <Button 
                     type={prediction === 'no' ? 'primary' : 'default'}
@@ -1137,7 +1206,7 @@ const TradeInterfaceBlue = () => {
                     }}
                     onClick={() => setPrediction('no')}
                   >
-                    НЕТ ({(market?.no_price * 100)?.toFixed(1)}%)
+                    НЕТ ({((market?.no_price || 0.5) * 100).toFixed(1)}%)
                   </Button>
                 </Space.Compact>
               </div>
@@ -1195,12 +1264,12 @@ const TradeInterfaceBlue = () => {
               </Text>
               
               <div style={{ maxHeight: '200px', overflowY: 'auto', marginBottom: 16 }}>
-                {purchasedContracts.length === 0 ? (
+                {sellableContracts.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: 16, background: '#f9f9f9', borderRadius: 8 }}>
-                    <Text type="secondary">У вас нет купленных контрактов</Text>
+                    <Text type="secondary">У вас нет доступных контрактов для продажи</Text>
                   </div>
                 ) : (
-                  purchasedContracts.map(contract => (
+                  sellableContracts.map(contract => (
                     <PositionCard 
                       key={contract.id}
                       className={selectedPosition?.id === contract.id ? 'selected' : ''}
@@ -1217,10 +1286,13 @@ const TradeInterfaceBlue = () => {
                               Заблокировано: {contract.locked_shares} шт.
                             </Text>
                           )}
+                          <Text type="secondary" style={{ fontSize: '12px', display: 'block' }}>
+                            Доступно: {(contract.shares - (contract.locked_shares || 0))} шт.
+                          </Text>
                         </div>
                         <div style={{ textAlign: 'right' }}>
                           <Text type="secondary" style={{ fontSize: '12px' }}>
-                            Стоимость: {((contract.shares || 0) * getCurrentPrice()).toFixed(2)} USDT
+                            Стоимость: {((contract.shares || 0) * getCurrentPrice(contract.outcome)).toFixed(2)} USDT
                           </Text>
                         </div>
                       </div>
