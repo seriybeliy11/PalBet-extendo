@@ -1003,15 +1003,15 @@ const TradeInterfaceBlue = () => {
     return prediction === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
   };
 
+  const getPositionPrice = (outcome) => {
+    if (!market) return 0.5;
+    return outcome === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
+  };
+
   const handlePositionSelect = (position) => {
     setSelectedPosition(position);
     setSellAmount(position.shares - (position.locked_shares || 0));
-    setMinPrice(getCurrentPrice(position.outcome));
-  };
-
-  const getCurrentPrice = (outcome) => {
-    if (!market) return 0.5;
-    return outcome === 'yes' ? (market.yes_price || 0.5) : (market.no_price || 0.5);
+    setMinPrice(getPositionPrice(position.outcome));
   };
 
   if (market && market.resolved) {
@@ -1292,7 +1292,7 @@ const TradeInterfaceBlue = () => {
                         </div>
                         <div style={{ textAlign: 'right' }}>
                           <Text type="secondary" style={{ fontSize: '12px' }}>
-                            Стоимость: {((contract.shares || 0) * getCurrentPrice(contract.outcome)).toFixed(2)} USDT
+                            Стоимость: {((contract.shares || 0) * getPositionPrice(contract.outcome)).toFixed(2)} USDT
                           </Text>
                         </div>
                       </div>
